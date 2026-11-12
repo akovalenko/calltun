@@ -92,7 +92,7 @@ func registerCommon(fs *flag.FlagSet, c *commonFlags) {
 
 func initLog(verbose bool) {
 	lvl := slog.LevelInfo
-	if verbose {
+	if verbose || os.Getenv("CALLTUN_VERBOSE") != "" {
 		lvl = slog.LevelDebug
 	}
 	lg = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
