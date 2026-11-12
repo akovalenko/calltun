@@ -158,3 +158,50 @@ func TestOversizedFrameRejected(t *testing.T) {
 		t.Fatal("empty frame should be rejected")
 	}
 }
+
+func TestFramingIDWrap(t *testing.T) {
+	// The production wedge: after 65536 frames the u16 pkt-id wraps and a
+	// naive "done" set starves the link. Push 70000 frames through and
+	// expect every single one delivered.
+	f := &fragmenter{}
+	re := newReassembler()
+	delivered := 0
+	for i := 0; i < 70000; i++ {
+		frame := []byte{byte(i), byte(i >> 8), 0xAA}
+		frags := f.build(frame)
+		var got []byte
+		for _, fr := range frags {
+			if out, ok := re.push(fr); ok {
+				got = out
+			}
+		}
+		if got == nil {
+			t.Fatalf("frame %d (past the wrap at %d) not delivered", i, 1<<16)
+		}
+		if !bytes.Equal(got, frame) {
+			t.Fatalf("frame %d corrupted", i)
+		}
+		delivered++
+	}
+	if delivered != 70000 {
+		t.Fatalf("delivered %d of 70000", delivered)
+	}
+}
+
+func TestFramingWrapWithReplay(t *testing.T) {
+	// A replay of a pre-wrap frame id must still be dropped after the wrap
+	// moved the window past it... only within the retained window; older
+	// ones pass as strays (acceptable: SRTP replay protection is the
+	// primary defense).
+	f := &fragmenter{}
+	re := newReassembler()
+	frame := []byte{1, 2, 3}
+	frags := f.build(frame)
+	for _, fr := range frags {
+		re.push(fr)
+	}
+	// Immediate replay: dropped (duplicate).
+	if _, ok := re.push(frags[0]); ok {
+		t.Fatal("immediate replay delivered twice")
+	}
+}

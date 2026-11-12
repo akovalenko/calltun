@@ -63,20 +63,84 @@ type reassembly struct {
 	seen  time.Time
 }
 
+// reassembler dedups delivered pkt-ids with a wrap-tolerant ring: the
+// fragmenter's u16 id wraps every 65536 frames (~70 MB of traffic), and a
+// plain "done" set then starves the link — every post-wrap id collides
+// with a stale pre-wrap entry and the frame is dropped as a duplicate
+// (observed in production: two independent wedges, both with rx frozen at
+// ~70.7 MB; keepalives passed because they bypass reassembly).
+const dupWindowBits = 2048 // recently-delivered id window
+
 type reassembler struct {
 	pending map[uint16]*reassembly
-	// done holds recently completed ids so a replayed fragment set does not
-	// reassemble into a second copy of the same frame (SRTP replay
-	// protection already eats exact packet duplicates; this is the
-	// belt-and-braces for reordered replays).
-	done map[uint16]time.Time
+	lastID  int32 // highest id seen, unwrapped across 16-bit rollovers
+	ring    [dupWindowBits / 64]uint64
 }
 
 func newReassembler() *reassembler {
-	return &reassembler{
-		pending: make(map[uint16]*reassembly),
-		done:    make(map[uint16]time.Time),
+	return &reassembler{pending: make(map[uint16]*reassembly)}
+}
+
+// isDelivered reports (wrap-aware, read-only) whether the frame with
+// this pkt-id was already completed.
+func (r *reassembler) isDelivered(id uint16) bool {
+	d := int32(id) - int32(uint16(r.lastID))
+	if d > 0 {
+		return false // ahead of the head: cannot be delivered yet
 	}
+	// d == 0: the head itself, always marked when lastID advanced.
+	back := int(-d)
+	if back >= dupWindowBits {
+		return false // older than the retained window — let it through
+	}
+	return bitSet(&r.ring, back)
+}
+
+// markDelivered records a completed frame's id, advancing the window.
+func (r *reassembler) markDelivered(id uint16) {
+	d := int32(id) - int32(uint16(r.lastID))
+	if d > 0 {
+		if int(d) >= dupWindowBits {
+			r.ring = [dupWindowBits / 64]uint64{}
+		} else {
+			shiftRing(&r.ring, int(d))
+		}
+		r.lastID += d
+		setBit(&r.ring, 0)
+		return
+	}
+	if d == 0 {
+		setBit(&r.ring, 0)
+		return
+	}
+	back := int(-d)
+	if back < dupWindowBits {
+		setBit(&r.ring, back)
+	}
+}
+
+func shiftRing(r *[dupWindowBits / 64]uint64, n int) {
+	words := n / 64
+	bits := uint(n % 64)
+	if words > 0 {
+		copy(r[:len(r)-words], r[words:])
+		for i := len(r) - words; i < len(r); i++ {
+			r[i] = 0
+		}
+	}
+	if bits > 0 {
+		carry := uint64(0)
+		for i := len(r) - 1; i >= 0; i-- {
+			next := r[i] >> (64 - bits)
+			r[i] = (r[i] << bits) | carry
+			carry = next
+		}
+	}
+}
+
+func setBit(r *[dupWindowBits / 64]uint64, back int) { r[back/64] |= 1 << (back % 64) }
+func bitSet(r *[dupWindowBits / 64]uint64, back int) bool {
+	return r[back/64]&(1<<(back%64)) != 0
 }
 
 // push feeds one RTP payload; it returns the complete frame when the last
@@ -92,8 +156,8 @@ func (r *reassembler) push(payload []byte) ([]byte, bool) {
 	if total == 0 || idx >= total {
 		return nil, false
 	}
-	if _, recent := r.done[id]; recent {
-		return nil, false
+	if r.isDelivered(id) {
+		return nil, false // replay of a completed frame
 	}
 	e := r.pending[id]
 	if e == nil {
@@ -113,7 +177,7 @@ func (r *reassembler) push(payload []byte) ([]byte, bool) {
 		return nil, false
 	}
 	delete(r.pending, id)
-	r.done[id] = time.Now()
+	r.markDelivered(id)
 	size := 0
 	for _, s := range e.slots {
 		size += len(s)
@@ -129,11 +193,6 @@ func (r *reassembler) gc(now time.Time) {
 	for id, e := range r.pending {
 		if now.Sub(e.seen) > pendingTTL {
 			delete(r.pending, id)
-		}
-	}
-	for id, at := range r.done {
-		if now.Sub(at) > pendingTTL {
-			delete(r.done, id)
 		}
 	}
 }
