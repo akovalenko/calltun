@@ -45,25 +45,32 @@ the os.File tun path, kept as a regression canary.
 
 See `examples/`: two template units (`calltun-up@`, `calltun-accept@`), an
 `/etc/network/interfaces` fragment (persistent device owned by the
-`calltun` user, MTU 1100, peer subnet routed into the tunnel) and the
+`calltun` user, MTU 1360, peer subnet routed into the tunnel) and the
 `restrict,command="... offer --link ct0"` authorized_keys line. The unit
 ordering follows the `ssh -w` recipe (After/Wants/BindsTo on the
 `.device` unit, carrier check in ExecStartPost, Restart=on-failure).
 
-## Bench
+## Framing: fire-and-forget
 
-`scripts/bench-arch.sh` (root) builds a same-host e2e bench: two netns
-with the tun devices moved in and a veth pair to the main netns as the
-media path. netns are required — on a single kernel any local address is
-in the local routing table, so ICMP replies to the "peer" ride lo and
-never traverse the reverse tunnel.
+One source frame = ONE RTP packet, no fragment ids, no reassembly, no
+dedup structures. A frame larger than the budget (1360 B) is dropped and
+counted, and the device MTU gate at attach refuses to start on a
+misconfigured MTU — otherwise oversized frames would vanish silently and
+TCP inside (MSS from the interface MTU) would die with no evidence.
 
-Measured there (v0): ping 0% loss both directions, 2000/3000-byte frames
-fragment and reassemble, ~140 Mbit/s over TCP (nc/dd probe). With 10%
-emulated loss in each direction: small pings lose ~1-(0.9·0.9), a
-3000-byte ping (3 fragments each way) ~1-0.9⁶ — graceful, no wedging,
-no ARQ by design (TCP inside the tunnel recovers; a NACK layer is a v2
-item).
+This simplicity is a scar, not just a taste: the v0 fragmenter/
+reassembler (u16 pkt-id, pending map, delivered-id ring) produced three
+production wedges, all in the ~70-215 MB range — a done-set starving on
+the id wrap at exactly 65536 frames, and stale-pending/ring cascades
+freezing the link again under iperf. Telemetry finally showed pion
+delivering single-fragment frames to ReadRTP while the reassembler
+rejected them as duplicates. The layer's only real function — carrying
+frames larger than one packet — never operates when the MTU is right.
+
+With MTU 1360 the budget also accommodates inner IPv6 (minimum MTU
+1280). Measured on the production link (lnvps <-> home, real NAT): iperf
+595 MB at 111 Mbit/s completing cleanly, pings 0% loss after, counter
+past 475k frames with no wraps to count anymore.
 
 tcpdump on the media path shows `0x80` RTP headers with PT 96 (VP8's usual
 payload type) and marker bits — by packet type, indistinguishable from a
@@ -74,10 +81,15 @@ item.
 
 ## Lessons baked into the code
 
+
 - **One sequence-number discipline per SSRC.** Two writers with different
   increment-vs-send orders collide seq numbers; the peer's SRTP replay
   filter eats the data silently (pion logs `duplicated packet` only under
   trace). Symptom from hell: keepalives pass, data never does.
+- **Fire-and-forget framing.** Every fragment-id / reassembly scheme is
+  a state machine living across 16-bit wraps; each wrap is a wedge
+  factory under loss. With a correct MTU every frame fits one packet —
+  delete the machine, gate the MTU loudly.
 - **ICE candidate exclusion** (`--no-if`): a candidate whose address is
   routed through a tunnel sends the media into that tunnel — on a
   same-host bench always, in a multi-hop mesh whenever the peer is
