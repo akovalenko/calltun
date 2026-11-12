@@ -1,0 +1,25 @@
+# /etc/systemd/system/calltun-accept@.service — responder side of link %i.
+# The device is created and configured by ifupdown (see etc-network-interfaces);
+# this unit only attaches and serves one signaling session per run.
+[Unit]
+Description=calltun responder for link %i
+After=networking.service network-online.target
+Wants=network-online.target
+After=sys-subsystem-net-devices-%i.device
+Wants=sys-subsystem-net-devices-%i.device
+BindsTo=sys-subsystem-net-devices-%i.device
+PartOf=networking.service
+
+[Service]
+User=calltun
+Group=calltun
+RuntimeDirectory=calltun
+EnvironmentFile=-/etc/calltun/%i.env
+ExecStart=/usr/local/bin/calltun accept --link %i --dev %i --mode tun
+# Started only once the carrier is up (we attached):
+ExecStartPost=/bin/sh -c 'i=0; until [ "$(cat /sys/class/net/%i/carrier 2>/dev/null)" = 1 ]; do i=$((i+1)); [ $i -ge 30 ] && exit 1; sleep 1; done'
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

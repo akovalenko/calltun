@@ -1,0 +1,22 @@
+# /etc/network/interfaces fragment for a calltun link — this side owns
+# 10.231.0.0/24, the peer 10.231.1.0/24 (each side's peer subnet routes
+# into the tunnel; adjust to taste). MTU 1100: a full frame fits into a
+# single 1200-byte RTP packet (header + SRTP tag + fragment header).
+#
+# Responder side (device ct0); the initiator side mirrors this with
+# 10.231.1.1/24 and the route to 10.231.0.0/24.
+
+auto ct0
+iface ct0 inet static
+    address 10.231.0.1/24
+    mtu 1100
+    pre-up test -e /sys/class/net/ct0 || ip tuntap add dev ct0 mode tun user calltun group calltun
+    post-down ip tuntap del dev ct0
+    up ip route replace 10.231.1.0/24 dev ct0
+
+# authorized_keys line for the calltun user (responder side); the key
+# offers signaling for exactly this link. Note: `restrict` is fine here —
+# it disables forwarding/pty but keeps forced commands (unlike tun
+# channels, which `restrict` also blocks; we need none).
+#
+# restrict,command="/usr/local/bin/calltun offer --link ct0" ssh-ed25519 AAAA... calltun-ct0
