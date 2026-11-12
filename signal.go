@@ -81,7 +81,7 @@ func signalInitiator(ctx context.Context, c *sigConn, p *peer) error {
 	if err := c.send(sigMsg{Type: "offer", SDP: p.pc.LocalDescription().SDP}); err != nil {
 		return fmt.Errorf("send offer: %w", err)
 	}
-	lg.Debug("offer sent", "sdp_bytes", len(p.pc.LocalDescription().SDP))
+	lg.Debug("offer sent", "sdp", p.pc.LocalDescription().SDP)
 
 	ans, err := c.recv()
 	if err != nil {
@@ -137,6 +137,7 @@ func signalResponder(ctx context.Context, c *sigConn, p *peer) error {
 	if err := c.send(sigMsg{Type: "answer", SDP: p.pc.LocalDescription().SDP}); err != nil {
 		return fmt.Errorf("send answer: %w", err)
 	}
+	lg.Debug("answer sent", "sdp", p.pc.LocalDescription().SDP)
 	if err := p.waitConnected(ctx); err != nil {
 		return err
 	}

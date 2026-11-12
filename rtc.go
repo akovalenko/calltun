@@ -10,11 +10,25 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"os"
+	"sync"
 
 	"github.com/pion/interceptor"
+	"github.com/pion/logging"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
+
+// pionLogger returns the pion LoggerFactory: with CALLTUN_PIONLOG=1 every
+// subsystem logs at trace level to stderr (SRTP decrypt failures and demux
+// drops are invisible at our level).
+func pionLogger() logging.LoggerFactory {
+	f := logging.NewDefaultLoggerFactory()
+	if os.Getenv("CALLTUN_PIONLOG") != "" {
+		f.DefaultLogLevel = logging.LogLevelTrace
+	}
+	return f
+}
 
 const (
 	payloadType = 96   // dynamic PT, VP8 in real calls
@@ -29,7 +43,12 @@ type peer struct {
 	gatherDone chan struct{}
 }
 
-func newPeer(stun []string) (*peer, error) {
+// newPeer builds the m=video-only PeerConnection. excludeIfs are interface
+// names never to gather candidates on: the tunnel device(s) this daemon
+// serves, plus anything the operator knows is reachable only THROUGH a
+// tunnel (other links of a mesh) — media sent to such an address is routed
+// into the tunnel and eaten by our own reader.
+func newPeer(stun []string, excludeIfs []string) (*peer, error) {
 	m := &webrtc.MediaEngine{}
 	vp8 := webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
@@ -47,9 +66,19 @@ func newPeer(stun []string) (*peer, error) {
 		return nil, err
 	}
 
+	se := webrtc.SettingEngine{}
+	se.LoggerFactory = pionLogger()
+	if len(excludeIfs) > 0 {
+		bad := make(map[string]bool, len(excludeIfs))
+		for _, n := range excludeIfs {
+			bad[n] = true
+		}
+		se.SetInterfaceFilter(func(name string) bool { return !bad[name] })
+	}
 	api := webrtc.NewAPI(
 		webrtc.WithMediaEngine(m),
 		webrtc.WithInterceptorRegistry(ir),
+		webrtc.WithSettingEngine(se),
 	)
 
 	cfg := webrtc.Configuration{}
@@ -122,7 +151,12 @@ func (p *peer) waitConnected(ctx context.Context) error {
 }
 
 // rtpWriter turns source frames into RTP packets on our outgoing track.
+// All writes are serialized: the data goroutine and the keepalive goroutine
+// share the track, and pion's WriteRTP/SRTP encryptor is not safe for
+// concurrent use (racing writes corrupt packets; the peer drops them on
+// auth failure).
 type rtpWriter struct {
+	mu    sync.Mutex
 	track *webrtc.TrackLocalStaticRTP
 	seq   uint16
 	ts    uint32
@@ -144,6 +178,8 @@ func randUint32() uint32 {
 // writeFrags sends the RTP payloads of one source frame (same timestamp,
 // marker set on the last fragment, sequence numbers contiguous).
 func (w *rtpWriter) writeFrags(frags [][]byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	for i, payload := range frags {
 		pkt := &rtp.Packet{
 			Header: rtp.Header{
@@ -167,13 +203,21 @@ func (w *rtpWriter) writeFrags(frags [][]byte) error {
 
 // keepalive sends a sub-header packet (dropped by the receiver) to bind the
 // peer's OnTrack and to keep the NAT mapping fresh on an idle link.
+// keepalive uses the SAME seq discipline as writeFrags: send with the
+// current value, then increment. A mismatched discipline collides seqs
+// with data packets, and the peer's SRTP replay filter silently eats the
+// data ("duplicated packet").
 func (w *rtpWriter) keepalive() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	seq := w.seq
 	w.seq++
+	_ = seq
 	return w.track.WriteRTP(&rtp.Packet{
 		Header: rtp.Header{
 			Version:        2,
 			PayloadType:    payloadType,
-			SequenceNumber: w.seq,
+			SequenceNumber: seq,
 			Timestamp:      w.ts,
 			SSRC:           w.ssrc,
 		},

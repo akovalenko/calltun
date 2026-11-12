@@ -31,6 +31,30 @@ type counters struct {
 }
 
 func runTunnel(ctx context.Context, p *peer, dev io.ReadWriteCloser) error {
+	w := newRTPWriter(p.track)
+	frag := &fragmenter{}
+	re := newReassembler()
+	var c counters
+	errCh := make(chan error, 3)
+
+	// Keepalives must flow before the remote track binds: the peer's
+	// OnTrack fires on our first RTP packet, and vice versa.
+	go func() {
+		t := time.NewTicker(keepaliveEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if err := w.keepalive(); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}
+	}()
+
 	// Wait for the remote track to bind (our keepalives trigger the peer's
 	// OnTrack, and its keepalives trigger ours).
 	var remote *webrtc.TrackRemote
@@ -42,12 +66,6 @@ func runTunnel(ctx context.Context, p *peer, dev io.ReadWriteCloser) error {
 		return ctx.Err()
 	}
 	lg.Info("remote track bound", "kind", remote.Kind().String(), "ssrc", remote.SSRC())
-
-	w := newRTPWriter(p.track)
-	frag := &fragmenter{}
-	re := newReassembler()
-	var c counters
-	errCh := make(chan error, 3)
 
 	// dev -> RTP
 	go func() {
@@ -68,6 +86,7 @@ func runTunnel(ctx context.Context, p *peer, dev io.ReadWriteCloser) error {
 				errCh <- err
 				return
 			}
+			lg.Debug("tx frame", "len", n, "frags", len(frags))
 			c.txFrames.Add(1)
 			c.txBytes.Add(uint64(n))
 		}
@@ -81,10 +100,16 @@ func runTunnel(ctx context.Context, p *peer, dev io.ReadWriteCloser) error {
 				errCh <- err
 				return
 			}
+			lg.Debug("rx rtp", "seq", pkt.SequenceNumber, "len", len(pkt.Payload), "marker", pkt.Marker, "ssrc", pkt.SSRC)
 			frame, ok := re.push(pkt.Payload)
 			if !ok {
 				if len(pkt.Payload) < fragHdr {
 					c.rxJunk.Add(1)
+					lg.Debug("rx short payload (keepalive)", "len", len(pkt.Payload))
+				} else {
+					lg.Debug("rx fragment not completing a frame",
+						"id", uint16(pkt.Payload[0])<<8|uint16(pkt.Payload[1]),
+						"idx", pkt.Payload[2], "total", pkt.Payload[3], "depth", re.depth())
 				}
 				continue
 			}
@@ -97,8 +122,6 @@ func runTunnel(ctx context.Context, p *peer, dev io.ReadWriteCloser) error {
 		}
 	}()
 
-	keep := time.NewTicker(keepaliveEvery)
-	defer keep.Stop()
 	stats := time.NewTicker(statsEvery)
 	defer stats.Stop()
 
@@ -114,10 +137,6 @@ func runTunnel(ctx context.Context, p *peer, dev io.ReadWriteCloser) error {
 		case s := <-p.states:
 			if deadState(s) {
 				return errors.New("ice " + s.String())
-			}
-		case <-keep.C:
-			if err := w.keepalive(); err != nil {
-				return err
 			}
 		case <-stats.C:
 			lg.Info("stats",

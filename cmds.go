@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -24,10 +25,11 @@ const (
 func cmdUp(ctx context.Context, args []string) error {
 	fs := newFlagSet("up")
 	var c commonFlags
-	var sshAlias, offerCmd string
+	var sshAlias, offerCmd, noIf string
 	registerCommon(fs, &c)
 	fs.StringVar(&sshAlias, "ssh", "", "ssh destination (alias from ssh_config); required")
 	fs.StringVar(&offerCmd, "offer-cmd", "calltun", "remote calltun binary (path or command) for the offer bridge")
+	fs.StringVar(&noIf, "no-if", "", "comma list of interfaces to never gather ICE candidates on (default: --dev)")
 	fs.Parse(args)
 	initLog(c.verbose)
 
@@ -47,7 +49,11 @@ func cmdUp(ctx context.Context, args []string) error {
 	defer dev.Close()
 	lg.Info("device attached", "dev", name)
 
-	p, err := newPeer(stunURLs(c.stun))
+	excluded := splitList(noIf)
+	if !containsStr(excluded, name) {
+		excluded = append(excluded, name)
+	}
+	p, err := newPeer(stunURLs(c.stun), excluded)
 	if err != nil {
 		return err
 	}
@@ -102,7 +108,9 @@ func cmdUp(ctx context.Context, args []string) error {
 func cmdAccept(ctx context.Context, args []string) error {
 	fs := newFlagSet("accept")
 	var c commonFlags
+	var noIf string
 	registerCommon(fs, &c)
+	fs.StringVar(&noIf, "no-if", "", "comma list of interfaces to never gather ICE candidates on (default: --dev)")
 	fs.Parse(args)
 	initLog(c.verbose)
 
@@ -119,7 +127,11 @@ func cmdAccept(ctx context.Context, args []string) error {
 	defer dev.Close()
 	lg.Info("device attached", "dev", name)
 
-	p, err := newPeer(stunURLs(c.stun))
+	excluded := splitList(noIf)
+	if !containsStr(excluded, name) {
+		excluded = append(excluded, name)
+	}
+	p, err := newPeer(stunURLs(c.stun), excluded)
 	if err != nil {
 		return err
 	}
@@ -230,4 +242,24 @@ type readWriteCloser struct {
 	io.Reader
 	io.Writer
 	io.Closer
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func containsStr(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
