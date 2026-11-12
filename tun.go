@@ -6,13 +6,17 @@ package main
 // addresses, routes and MTU belong to the host (ifupdown/iproute2); with a
 // persistent device owned by this user no CAP_NET_ADMIN is needed here.
 //
-// The fd is deliberately kept OUT of the os.File/netpoll machinery: on
-// go1.26 the eager epoll registration of /dev/net/tun fds collides with
-// the runtime's terminal probe (observed: another thread TCGETS2+close on
-// the fd, reads then fail with "not pollable"). Raw blocking I/O only.
+// The fd is deliberately kept OUT of the os.File/netpoll machinery and
+// read/written with raw blocking syscalls, the same pattern wireguard-go
+// uses. One early bench run saw "read /dev/net/tun: not pollable" (another
+// thread TCGETS2+close on the fd per strace), but a later A/B canary
+// (CALLTUN_OSFILE=1) showed the os.File path passing on go1.26.4 AND
+// go1.27.4, in the same topology — so no Go-version attribution is
+// justified. Raw I/O stays: it is immune to this whole class by design.
 
 import (
 	"fmt"
+	"os"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -21,9 +25,14 @@ import (
 type tunFD struct {
 	fd   int
 	name string
+	wrap *osFileWrap // non-nil only in the os.File canary mode
 }
 
 func attachDevice(name string, tap bool) (*tunFD, error) {
+	if os.Getenv("CALLTUN_OSFILE") != "" {
+		// Regression canary: the os.File/netpoll path (see file comment).
+		return attachDeviceOsFile(name, tap)
+	}
 	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open /dev/net/tun (exists? permissions?): %w", err)
@@ -52,6 +61,9 @@ func attachDevice(name string, tap bool) (*tunFD, error) {
 
 // Read blocks until a frame arrives; raw blocking syscall, no netpoll.
 func (t *tunFD) Read(p []byte) (int, error) {
+	if t.wrap != nil {
+		return t.wrap.Read(p)
+	}
 	for {
 		n, err := unix.Read(t.fd, p)
 		if err == unix.EINTR {
@@ -66,6 +78,9 @@ func (t *tunFD) Read(p []byte) (int, error) {
 
 // Write sends one frame; TUN writes are all-or-nothing, but loop anyway.
 func (t *tunFD) Write(p []byte) (int, error) {
+	if t.wrap != nil {
+		return t.wrap.Write(p)
+	}
 	written := 0
 	for written < len(p) {
 		n, err := unix.Write(t.fd, p[written:])
@@ -81,5 +96,37 @@ func (t *tunFD) Write(p []byte) (int, error) {
 }
 
 func (t *tunFD) Close() error {
+	if t.wrap != nil {
+		return t.wrap.Close()
+	}
 	return unix.Close(t.fd)
 }
+
+// attachDeviceOsFile is the os.File-based variant kept as a canary for the
+// netpoll/terminal-probe interaction; select it with CALLTUN_OSFILE=1.
+func attachDeviceOsFile(name string, tap bool) (*tunFD, error) {
+	f, err := os.OpenFile("/dev/net/tun", os.O_RDWR, 0)
+	if err != nil {
+		return nil, err
+	}
+	flags := uint16(unix.IFF_TUN | unix.IFF_NO_PI)
+	if tap {
+		flags = unix.IFF_TAP | unix.IFF_NO_PI
+	}
+	var ifr [unix.IFNAMSIZ + 2]byte
+	copy(ifr[:unix.IFNAMSIZ-1], name)
+	*(*uint16)(unsafe.Pointer(&ifr[unix.IFNAMSIZ])) = flags
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, f.Fd(), unix.TUNSETIFF, uintptr(unsafe.Pointer(&ifr[0])))
+	if errno != 0 {
+		f.Close()
+		return nil, fmt.Errorf("attach %s (osfile): %w", name, errno)
+	}
+	w := &osFileWrap{f: f}
+	return &tunFD{name: name, wrap: w}, nil
+}
+
+type osFileWrap struct{ f *os.File }
+
+func (w *osFileWrap) Read(p []byte) (int, error)  { return w.f.Read(p) }
+func (w *osFileWrap) Write(p []byte) (int, error) { return w.f.Write(p) }
+func (w *osFileWrap) Close() error                { return w.f.Close() }
