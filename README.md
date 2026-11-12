@@ -38,7 +38,12 @@ device-name prefix), `--stun LIST` (default `stun.l.google.com:19302`,
 `none` = host candidates only), `--ice-timeout`, `-v`.
 `--no-if A,B` — interfaces never to gather ICE candidates on (defaults to
 the served device; see "candidate exclusion" below). `CALLTUN_NO_IF` is
-the env fallback for unit-driven daemons.
+the env fallback for unit-driven daemons. `--if eth0` (env `CALLTUN_IF`)
+pins gathering to the listed interfaces ONLY — the allowlist wins over
+the exclusion list and is the robust choice for hosts running several
+links (fallback tunnels on one acceptor): pinning the WAN interface
+makes media loops through sibling tunnels impossible by construction.
+Pin lists containing the served device are refused at startup.
 `CALLTUN_PIONLOG=1` — pion subsystem trace logging; `CALLTUN_OSFILE=1` —
 the os.File tun path, kept as a regression canary.
 

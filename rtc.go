@@ -49,7 +49,7 @@ type peer struct {
 // serves, plus anything the operator knows is reachable only THROUGH a
 // tunnel (other links of a mesh) — media sent to such an address is routed
 // into the tunnel and eaten by our own reader.
-func newPeer(stun []string, excludeIfs []string) (*peer, error) {
+func newPeer(stun []string, excludeIfs, pinIfs []string) (*peer, error) {
 	m := &webrtc.MediaEngine{}
 	vp8 := webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
@@ -82,7 +82,20 @@ func newPeer(stun []string, excludeIfs []string) (*peer, error) {
 
 	se := webrtc.SettingEngine{}
 	se.LoggerFactory = pionLogger()
-	if len(excludeIfs) > 0 {
+	switch {
+	case len(pinIfs) > 0:
+		// Allowlist: gather ONLY on these interfaces. The robust inverse
+		// of the exclusion list — with many links on one host (fallback
+		// tunnels) enumerating every dangerous interface is fragile,
+		// while pinning the WAN interface makes media loops impossible
+		// by construction. srflx candidates are still derived from these
+		// sockets, so STUN traversal is unaffected.
+		good := make(map[string]bool, len(pinIfs))
+		for _, n := range pinIfs {
+			good[n] = true
+		}
+		se.SetInterfaceFilter(func(name string) bool { return good[name] })
+	case len(excludeIfs) > 0:
 		bad := make(map[string]bool, len(excludeIfs))
 		for _, n := range excludeIfs {
 			bad[n] = true

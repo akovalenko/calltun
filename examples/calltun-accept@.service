@@ -14,7 +14,9 @@ PartOf=networking.service
 User=calltun
 Group=calltun
 RuntimeDirectory=calltun
-# CALLTUN_NO_IF can list extra interfaces to exclude (comma list).
+# CALLTUN_NO_IF can list extra interfaces to exclude (comma list);
+# CALLTUN_IF=eth0 pins gathering to specific interfaces (wins) — with
+# several fallback links on one acceptor, pin each side's WAN interface.
 EnvironmentFile=-/etc/calltun/%i.env
 ExecStart=/usr/local/bin/calltun accept --link %i --dev %i --mode tun
 # Started only once the carrier is up (we attached):

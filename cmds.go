@@ -25,11 +25,12 @@ const (
 func cmdUp(ctx context.Context, args []string) error {
 	fs := newFlagSet("up")
 	var c commonFlags
-	var sshAlias, offerCmd, noIf string
+	var sshAlias, offerCmd, noIf, pinIf string
 	registerCommon(fs, &c)
 	fs.StringVar(&sshAlias, "ssh", "", "ssh destination (alias from ssh_config); required")
 	fs.StringVar(&offerCmd, "offer-cmd", "calltun", "remote calltun binary (path or command) for the offer bridge")
 	fs.StringVar(&noIf, "no-if", "", "comma list of interfaces to never gather ICE candidates on (default: --dev)")
+	fs.StringVar(&pinIf, "if", "", "pin ICE candidates to these interfaces ONLY (overrides --no-if)")
 	fs.Parse(args)
 	initLog(c.verbose)
 
@@ -40,6 +41,9 @@ func cmdUp(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	if pins := pinnedIfaces(pinIf, name); containsStr(pins, name) {
+		return fmt.Errorf("--if must not include the served device %s (media would loop into its own reader)", name)
+	}
 	lg.Info("calltun up starting", "link", c.link, "dev", name, "mode", modeName(tap), "ssh", sshAlias)
 
 	dev, err := attachDevice(name, tap)
@@ -49,8 +53,8 @@ func cmdUp(ctx context.Context, args []string) error {
 	defer dev.Close()
 	lg.Info("device attached", "dev", name)
 
-	excluded := excludedIfaces(noIf, name)
-	p, err := newPeer(stunURLs(c.stun), excluded)
+	pins := pinnedIfaces(pinIf, name)
+	p, err := newPeer(stunURLs(c.stun), excludedIfaces(noIf, name), pins)
 	if err != nil {
 		return err
 	}
@@ -105,15 +109,19 @@ func cmdUp(ctx context.Context, args []string) error {
 func cmdAccept(ctx context.Context, args []string) error {
 	fs := newFlagSet("accept")
 	var c commonFlags
-	var noIf string
+	var noIf, pinIf string
 	registerCommon(fs, &c)
 	fs.StringVar(&noIf, "no-if", "", "comma list of interfaces to never gather ICE candidates on (default: --dev)")
+	fs.StringVar(&pinIf, "if", "", "pin ICE candidates to these interfaces ONLY (overrides --no-if)")
 	fs.Parse(args)
 	initLog(c.verbose)
 
 	name, tap, err := resolveDevice(&c)
 	if err != nil {
 		return err
+	}
+	if pins := pinnedIfaces(pinIf, name); containsStr(pins, name) {
+		return fmt.Errorf("--if must not include the served device %s (media would loop into its own reader)", name)
 	}
 	lg.Info("calltun accept starting", "link", c.link, "dev", name, "mode", modeName(tap))
 
@@ -124,8 +132,8 @@ func cmdAccept(ctx context.Context, args []string) error {
 	defer dev.Close()
 	lg.Info("device attached", "dev", name)
 
-	excluded := excludedIfaces(noIf, name)
-	p, err := newPeer(stunURLs(c.stun), excluded)
+	pins := pinnedIfaces(pinIf, name)
+	p, err := newPeer(stunURLs(c.stun), excludedIfaces(noIf, name), pins)
 	if err != nil {
 		return err
 	}
@@ -241,6 +249,17 @@ type readWriteCloser struct {
 	io.Reader
 	io.Writer
 	io.Closer
+}
+
+// pinnedIfaces resolves the pin (allowlist): --if wins, CALLTUN_IF is
+// the fallback. Pinning to the served device itself is refused — media
+// would loop into our own reader.
+func pinnedIfaces(flagVal, dev string) []string {
+	list := splitList(flagVal)
+	if len(list) == 0 {
+		list = splitList(os.Getenv("CALLTUN_IF"))
+	}
+	return list
 }
 
 // excludedIfaces resolves the interface-exclusion list: --no-if wins,
