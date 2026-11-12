@@ -56,6 +56,20 @@ func attachDevice(name string, tap bool) (*tunFD, error) {
 			return nil, fmt.Errorf("attach %s: %w", name, errno)
 		}
 	}
+	// MTU gate: with fire-and-forget framing a frame larger than the
+	// budget would be silently lost — and TCP inside sizes its segments
+	// from the interface MTU, so a whole segment class would die quietly.
+	// Refuse instead: crash-only, the misconfiguration is visible in the
+	// unit log.
+	mtuPath := "/sys/class/net/" + name + "/mtu"
+	if b, err := os.ReadFile(mtuPath); err == nil {
+		var mtu int
+		if _, err := fmt.Sscanf(string(b), "%d", &mtu); err == nil && mtu > maxFrame {
+			unix.Close(fd)
+			return nil, fmt.Errorf("%s: MTU %d exceeds the fire-and-forget budget %d — set the device MTU to %d or lower",
+				name, mtu, maxFrame, maxFrame)
+		}
+	}
 	return &tunFD{fd: fd, name: name}, nil
 }
 

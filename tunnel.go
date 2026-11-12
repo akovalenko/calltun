@@ -32,8 +32,6 @@ type counters struct {
 
 func runTunnel(ctx context.Context, p *peer, dev io.ReadWriteCloser) error {
 	w := newRTPWriter(p.track)
-	frag := &fragmenter{}
-	re := newReassembler()
 	var c counters
 	errCh := make(chan error, 3)
 
@@ -77,12 +75,11 @@ func runTunnel(ctx context.Context, p *peer, dev io.ReadWriteCloser) error {
 				return
 			}
 			frame := buf[:n]
-			frags := frag.build(frame)
-			if frags == nil {
+			if n > maxFrame {
 				c.txDropped.Add(1)
 				continue
 			}
-			if err := w.writeFrags(frags); err != nil {
+			if err := w.writeFrame(frame); err != nil {
 				// This is an unreliable transport by design: under buffer
 				// pressure drop the frame, back off briefly, keep the
 				// link alive — never die on a transient write error.
@@ -96,7 +93,6 @@ func runTunnel(ctx context.Context, p *peer, dev io.ReadWriteCloser) error {
 				}
 				continue
 			}
-			lg.Debug("tx frame", "len", n, "frags", len(frags))
 			c.txFrames.Add(1)
 			c.txBytes.Add(uint64(n))
 		}
@@ -110,25 +106,17 @@ func runTunnel(ctx context.Context, p *peer, dev io.ReadWriteCloser) error {
 				errCh <- err
 				return
 			}
-			lg.Debug("rx rtp", "seq", pkt.SequenceNumber, "len", len(pkt.Payload), "marker", pkt.Marker, "ssrc", pkt.SSRC)
-			frame, ok := re.push(pkt.Payload)
-			if !ok {
-				if len(pkt.Payload) < fragHdr {
-					c.rxJunk.Add(1)
-					lg.Debug("rx short payload (keepalive)", "len", len(pkt.Payload))
-				} else {
-					lg.Debug("rx fragment not completing a frame",
-						"id", uint16(pkt.Payload[0])<<8|uint16(pkt.Payload[1]),
-						"idx", pkt.Payload[2], "total", pkt.Payload[3], "depth", re.depth())
-				}
+			if len(pkt.Payload) < 2 {
+				c.rxJunk.Add(1) // keepalive
 				continue
 			}
-			if _, err := dev.Write(frame); err != nil {
+			lg.Debug("rx rtp", "seq", pkt.SequenceNumber, "len", len(pkt.Payload), "marker", pkt.Marker, "ssrc", pkt.SSRC)
+			if _, err := dev.Write(pkt.Payload); err != nil {
 				errCh <- err
 				return
 			}
 			c.rxFrames.Add(1)
-			c.rxBytes.Add(uint64(len(frame)))
+			c.rxBytes.Add(uint64(len(pkt.Payload)))
 		}
 	}()
 
@@ -154,8 +142,7 @@ func runTunnel(ctx context.Context, p *peer, dev io.ReadWriteCloser) error {
 		case <-stats.C:
 			lg.Info("stats",
 				"tx_frames", c.txFrames.Load(), "tx_bytes", c.txBytes.Load(), "tx_dropped", c.txDropped.Load(),
-				"rx_frames", c.rxFrames.Load(), "rx_bytes", c.rxBytes.Load(), "rx_junk", c.rxJunk.Load(),
-				"reasm_depth", re.depth())
+				"rx_frames", c.rxFrames.Load(), "rx_bytes", c.rxBytes.Load(), "rx_junk", c.rxJunk.Load())
 		}
 	}
 }

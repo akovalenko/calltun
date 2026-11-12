@@ -189,30 +189,28 @@ func randUint32() uint32 {
 	return binary.BigEndian.Uint32(b[:])
 }
 
-// writeFrags sends the RTP payloads of one source frame (same timestamp,
-// marker set on the last fragment, sequence numbers contiguous).
-func (w *rtpWriter) writeFrags(frags [][]byte) error {
+// writeFrame sends one source frame as one RTP packet (marker set, like
+// the last packet of a video frame). The same seq discipline as
+// keepalive: send with the current value, then increment — a mismatched
+// discipline collides seqs and the peer's SRTP replay filter eats the
+// data.
+func (w *rtpWriter) writeFrame(frame []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	for i, payload := range frags {
-		pkt := &rtp.Packet{
-			Header: rtp.Header{
-				Version:        2,
-				Marker:         i == len(frags)-1,
-				PayloadType:    payloadType,
-				SequenceNumber: w.seq,
-				Timestamp:      w.ts,
-				SSRC:           w.ssrc,
-			},
-			Payload: payload,
-		}
-		w.seq++
-		if err := w.track.WriteRTP(pkt); err != nil {
-			return err
-		}
+	pkt := &rtp.Packet{
+		Header: rtp.Header{
+			Version:        2,
+			Marker:         true,
+			PayloadType:    payloadType,
+			SequenceNumber: w.seq,
+			Timestamp:      w.ts,
+			SSRC:           w.ssrc,
+		},
+		Payload: frame,
 	}
+	w.seq++
 	w.ts += tsStep
-	return nil
+	return w.track.WriteRTP(pkt)
 }
 
 // keepalive sends a sub-header packet (dropped by the receiver) to bind the
