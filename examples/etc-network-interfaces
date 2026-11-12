@@ -1,7 +1,10 @@
 # /etc/network/interfaces fragment for a calltun link — this side owns
 # 10.231.0.0/24, the peer 10.231.1.0/24 (each side's peer subnet routes
-# into the tunnel; adjust to taste). MTU 1360: a full frame fits into a
-# single RTP packet (header + SRTP tag; also fits IPv6's minimum MTU).
+# into the tunnel; adjust to taste). MTU 1370: a full frame fits into a
+# single RTP packet; the attach-time gate accepts up to 1384 (1500 path
+# minus outer headers in the worst case). 1370 also matches the common
+# wg-inside-vxlan figure, so migrating infra keeps its visible MTU, and
+# inner IPv6 (min 1280) fits as well.
 #
 # Responder side (device ct0); the initiator side mirrors this with
 # 10.231.1.1/24 and the route to 10.231.0.0/24.
@@ -9,7 +12,7 @@
 auto ct0
 iface ct0 inet static
     address 10.231.0.1/24
-    mtu 1360
+    mtu 1370
     pre-up test -e /sys/class/net/ct0 || ip tuntap add dev ct0 mode tun user calltun group calltun
     post-down ip tuntap del dev ct0
     up ip route replace 10.231.1.0/24 dev ct0

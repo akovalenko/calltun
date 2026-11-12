@@ -53,10 +53,13 @@ ordering follows the `ssh -w` recipe (After/Wants/BindsTo on the
 ## Framing: fire-and-forget
 
 One source frame = ONE RTP packet, no fragment ids, no reassembly, no
-dedup structures. A frame larger than the budget (1360 B) is dropped and
-counted, and the device MTU gate at attach refuses to start on a
-misconfigured MTU — otherwise oversized frames would vanish silently and
-TCP inside (MSS from the interface MTU) would die with no evidence.
+dedup structures. A frame larger than the budget is dropped and counted,
+and the device MTU gate at attach refuses to start on a misconfigured
+MTU — otherwise oversized frames would vanish silently and TCP inside
+(MSS from the interface MTU) would die with no evidence. The gate
+accepts MTU up to 1384 (1500 path minus outer headers, worst case); 1370
+is the recommended figure — it matches wg-inside-vxlan conventions, so
+migrated infra keeps its visible MTU.
 
 This simplicity is a scar, not just a taste: the v0 fragmenter/
 reassembler (u16 pkt-id, pending map, delivered-id ring) produced three
