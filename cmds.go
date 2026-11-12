@@ -160,6 +160,11 @@ func cmdAccept(ctx context.Context, args []string) error {
 			errCh <- err
 			return
 		}
+		// One session per daemon life (crash-only). Closing the listener
+		// right away REFUSES later dialers instead of parking them in the
+		// listen backlog where nobody would ever read them — a wedged
+		// initiator then fails fast and systemd retries both ends.
+		ln.Close()
 		connCh <- conn
 	}()
 	lg.Info("waiting for signaling", "socket", path)

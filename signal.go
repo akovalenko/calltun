@@ -58,6 +58,27 @@ func (s *sigConn) recv() (sigMsg, error) {
 	return m, nil
 }
 
+// recvCtx is recv with a deadline: a blocking read alone would hang the
+// whole exchange forever (ssh pipes carry no deadlines), wedging both
+// daemons past every context timeout.
+func (s *sigConn) recvCtx(ctx context.Context) (sigMsg, error) {
+	type res struct {
+		m   sigMsg
+		err error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		m, err := s.recv()
+		ch <- res{m, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.m, r.err
+	case <-ctx.Done():
+		return sigMsg{}, ctx.Err()
+	}
+}
+
 func (s *sigConn) Close() error { return s.c.Close() }
 
 const sigReadyTimeout = 15 * time.Second
@@ -83,7 +104,7 @@ func signalInitiator(ctx context.Context, c *sigConn, p *peer) error {
 	}
 	lg.Debug("offer sent", "sdp", p.pc.LocalDescription().SDP)
 
-	ans, err := c.recv()
+	ans, err := c.recvCtx(ctx)
 	if err != nil {
 		return fmt.Errorf("recv answer: %w", err)
 	}
@@ -105,12 +126,12 @@ func signalInitiator(ctx context.Context, c *sigConn, p *peer) error {
 	if err := c.send(sigMsg{Type: "ready"}); err != nil {
 		return fmt.Errorf("send ready: %w", err)
 	}
-	return readyHandshake(c)
+	return readyHandshake(ctx, c)
 }
 
 // signalResponder is the accept-daemon half, symmetric to signalInitiator.
 func signalResponder(ctx context.Context, c *sigConn, p *peer) error {
-	off, err := c.recv()
+	off, err := c.recvCtx(ctx)
 	if err != nil {
 		return fmt.Errorf("recv offer: %w", err)
 	}
@@ -144,34 +165,24 @@ func signalResponder(ctx context.Context, c *sigConn, p *peer) error {
 	if err := c.send(sigMsg{Type: "ready"}); err != nil {
 		return fmt.Errorf("send ready: %w", err)
 	}
-	return readyHandshake(c)
+	return readyHandshake(ctx, c)
 }
 
 // readyHandshake waits for the peer's ready, bounded: both ICE states are
 // already connected, so a missing ready must not wedge the link.
-func readyHandshake(c *sigConn) error {
-	ch := make(chan sigMsg, 1)
-	errCh := make(chan error, 1)
-	go func() {
-		m, err := c.recv()
-		if err != nil {
-			errCh <- err
-			return
-		}
-		ch <- m
-	}()
-	select {
-	case m := <-ch:
-		if m.Type != "ready" {
-			return fmt.Errorf("expected ready, got %q", m.Type)
-		}
-		return nil
-	case err := <-errCh:
-		return fmt.Errorf("recv ready: %w", err)
-	case <-time.After(sigReadyTimeout):
-		lg.Warn("peer ready not received; proceeding (ICE is connected)")
-		return nil
+func readyHandshake(ctx context.Context, c *sigConn) error {
+	rctx, cancel := context.WithTimeout(ctx, sigReadyTimeout)
+	defer cancel()
+	m, err := c.recvCtx(rctx)
+	if err == nil && m.Type != "ready" {
+		return fmt.Errorf("expected ready, got %q", m.Type)
 	}
+	if err != nil {
+		// Both ICE states are connected; a peer that closed its transport
+		// right after sending ready must not wedge the link.
+		lg.Warn("peer ready not received; proceeding (ICE is connected)", "err", err)
+	}
+	return nil
 }
 
 // sendAbortf reports an error to the peer before failing.
