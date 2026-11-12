@@ -226,8 +226,11 @@ func (w *rtpWriter) keepalive() error {
 }
 
 // deadState reports whether an ICE state is unrecoverable for this link.
+// Disconnected is deliberately NOT fatal: under bulk load the consent
+// checks starve, the agent flaps to disconnected and can recover to
+// connected on its own — observed live: 2 minutes into an iperf run the
+// link "fell", only because the daemon treated the flap as terminal.
 func deadState(s webrtc.ICEConnectionState) bool {
 	return s == webrtc.ICEConnectionStateFailed ||
-		s == webrtc.ICEConnectionStateDisconnected ||
 		s == webrtc.ICEConnectionStateClosed
 }

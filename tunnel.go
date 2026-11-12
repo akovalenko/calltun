@@ -83,8 +83,18 @@ func runTunnel(ctx context.Context, p *peer, dev io.ReadWriteCloser) error {
 				continue
 			}
 			if err := w.writeFrags(frags); err != nil {
-				errCh <- err
-				return
+				// This is an unreliable transport by design: under buffer
+				// pressure drop the frame, back off briefly, keep the
+				// link alive — never die on a transient write error.
+				c.txDropped.Add(1)
+				lg.Warn("tx write failed, dropping frame", "err", err)
+				select {
+				case <-ctx.Done():
+					errCh <- err
+					return
+				case <-time.After(10 * time.Millisecond):
+				}
+				continue
 			}
 			lg.Debug("tx frame", "len", n, "frags", len(frags))
 			c.txFrames.Add(1)
@@ -137,6 +147,9 @@ func runTunnel(ctx context.Context, p *peer, dev io.ReadWriteCloser) error {
 		case s := <-p.states:
 			if deadState(s) {
 				return errors.New("ice " + s.String())
+			}
+			if s == webrtc.ICEConnectionStateDisconnected {
+				lg.Warn("ice disconnected (consent flap?); riding it out")
 			}
 		case <-stats.C:
 			lg.Info("stats",
