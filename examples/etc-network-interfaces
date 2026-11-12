@@ -1,7 +1,7 @@
 # /etc/network/interfaces fragment for a calltun link — this side owns
 # 10.231.0.0/24, the peer 10.231.1.0/24 (each side's peer subnet routes
-# into the tunnel; adjust to taste). MTU 1100: a full frame fits into a
-# single 1360-byte RTP packet (header + SRTP tag; also fits IPv6 min MTU).
+# into the tunnel; adjust to taste). MTU 1360: a full frame fits into a
+# single RTP packet (header + SRTP tag; also fits IPv6's minimum MTU).
 #
 # Responder side (device ct0); the initiator side mirrors this with
 # 10.231.1.1/24 and the route to 10.231.0.0/24.
