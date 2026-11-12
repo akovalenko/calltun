@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"github.com/pion/interceptor"
+	"github.com/pion/interceptor/pkg/report"
 	"github.com/pion/logging"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
@@ -62,8 +63,21 @@ func newPeer(stun []string, excludeIfs []string) (*peer, error) {
 	}
 
 	ir := &interceptor.Registry{}
-	if err := webrtc.RegisterDefaultInterceptors(m, ir); err != nil {
-		return nil, err
+	if os.Getenv("CALLTUN_FULL_INTERCEPTORS") != "" {
+		// A/B canary: pion's default set (adds the NACK generator/responder
+		// pair and TWCC). Default is reports-only: v0 wants no
+		// retransmissions, and the NACK pair poisons streams under loss
+		// (see README lessons).
+		if err := webrtc.RegisterDefaultInterceptors(m, ir); err != nil {
+			return nil, err
+		}
+	} else {
+		if f, err := report.NewReceiverInterceptor(); err == nil {
+			ir.Add(f)
+		}
+		if f, err := report.NewSenderInterceptor(); err == nil {
+			ir.Add(f)
+		}
 	}
 
 	se := webrtc.SettingEngine{}
