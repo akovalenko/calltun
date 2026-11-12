@@ -17,7 +17,8 @@ Group=calltun
 EnvironmentFile=/etc/calltun/%i.env
 # SSH_ALIAS=peer-host          (ssh_config alias; tor via ProxyCommand there)
 # STUN=stun.l.google.com:19302 (or "none" for host candidates only)
-# NO_IF=                       (extra interfaces to exclude, see README)
+# CALLTUN_NO_IF=               (extra interfaces to never gather ICE
+#                               candidates on, comma list; --no-if wins)
 ExecStart=/usr/local/bin/calltun up --link %i --dev %i --mode tun --ssh ${SSH_ALIAS}
 ExecStartPost=/bin/sh -c 'i=0; until [ "$(cat /sys/class/net/%i/carrier 2>/dev/null)" = 1 ]; do i=$((i+1)); [ $i -ge 30 ] && exit 1; sleep 1; done'
 Restart=on-failure

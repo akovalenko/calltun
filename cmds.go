@@ -49,10 +49,7 @@ func cmdUp(ctx context.Context, args []string) error {
 	defer dev.Close()
 	lg.Info("device attached", "dev", name)
 
-	excluded := splitList(noIf)
-	if !containsStr(excluded, name) {
-		excluded = append(excluded, name)
-	}
+	excluded := excludedIfaces(noIf, name)
 	p, err := newPeer(stunURLs(c.stun), excluded)
 	if err != nil {
 		return err
@@ -127,10 +124,7 @@ func cmdAccept(ctx context.Context, args []string) error {
 	defer dev.Close()
 	lg.Info("device attached", "dev", name)
 
-	excluded := splitList(noIf)
-	if !containsStr(excluded, name) {
-		excluded = append(excluded, name)
-	}
+	excluded := excludedIfaces(noIf, name)
 	p, err := newPeer(stunURLs(c.stun), excluded)
 	if err != nil {
 		return err
@@ -247,6 +241,20 @@ type readWriteCloser struct {
 	io.Reader
 	io.Writer
 	io.Closer
+}
+
+// excludedIfaces resolves the interface-exclusion list: --no-if wins,
+// CALLTUN_NO_IF is the fallback (units set it via an EnvironmentFile),
+// and the served device is always excluded last.
+func excludedIfaces(flagVal, dev string) []string {
+	list := splitList(flagVal)
+	if len(list) == 0 {
+		list = splitList(os.Getenv("CALLTUN_NO_IF"))
+	}
+	if !containsStr(list, dev) {
+		list = append(list, dev)
+	}
+	return list
 }
 
 func splitList(s string) []string {

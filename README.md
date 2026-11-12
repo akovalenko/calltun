@@ -37,7 +37,8 @@ Common flags: `--dev` (default `--link`), `--mode tun|tap` (default by
 device-name prefix), `--stun LIST` (default `stun.l.google.com:19302`,
 `none` = host candidates only), `--ice-timeout`, `-v`.
 `--no-if A,B` — interfaces never to gather ICE candidates on (defaults to
-the served device; see "candidate exclusion" below).
+the served device; see "candidate exclusion" below). `CALLTUN_NO_IF` is
+the env fallback for unit-driven daemons.
 `CALLTUN_PIONLOG=1` — pion subsystem trace logging; `CALLTUN_OSFILE=1` —
 the os.File tun path, kept as a regression canary.
 
