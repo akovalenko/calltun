@@ -52,6 +52,7 @@ ip netns exec ct-a ip link set lo up
 ip netns exec ct-a ip addr add 10.231.20.2/24 dev veth-a
 ip netns exec ct-a ip link set veth-a up
 ip netns exec ct-a ip route add default via 10.231.20.1
+ip netns exec ct-a ip link set ctun0 mtu 1370
 ip netns exec ct-a ip addr add 10.231.0.1/24 dev ctun0
 ip netns exec ct-a ip link set ctun0 up
 ip netns exec ct-a ip route add 10.231.1.0/24 dev ctun0
@@ -60,6 +61,7 @@ ip netns exec ct-b ip link set lo up
 ip netns exec ct-b ip addr add 10.231.21.2/24 dev veth-b
 ip netns exec ct-b ip link set veth-b up
 ip netns exec ct-b ip route add default via 10.231.21.1
+ip netns exec ct-b ip link set ctun1 mtu 1370
 ip netns exec ct-b ip addr add 10.231.1.1/24 dev ctun1
 ip netns exec ct-b ip link set ctun1 up
 ip netns exec ct-b ip route add 10.231.0.0/24 dev ctun1
