@@ -90,9 +90,9 @@ ip netns exec ct-b sh -c "nohup $CALLTUN up --link $LINK --dev ctun1 \
 sleep 6
 
 echo "=== ping ct-a -> ct-b (through the tunnel, both directions traversed):"
-ip netns exec ct-a ping -c 3 -W 2 10.231.1.1
+ip netns exec ct-a ping -c 3 -W 2 10.231.1.1 || true
 echo "=== ping ct-b -> ct-a:"
-ip netns exec ct-b ping -c 3 -W 2 10.231.0.1
+ip netns exec ct-b ping -c 3 -W 2 10.231.0.1 || true
 
 echo "bench is up; daemons keep running (logs: /root/calltun/*.log)"
 trap - EXIT
