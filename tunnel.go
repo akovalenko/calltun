@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"sync/atomic"
@@ -13,6 +14,33 @@ import (
 
 	"github.com/pion/webrtc/v4"
 )
+
+// rtpPayload locates the RTP payload in a decrypted packet: offset and
+// length, honoring CSRC list, header extension and padding (RFC 3550).
+func rtpPayload(p []byte) (off, length int, ok bool) {
+	if len(p) < 12 || p[0]&0xC0 != 0x80 { // version 2
+		return 0, 0, false
+	}
+	off = 12 + 4*int(p[0]&0x0F) // CSRC count
+	if p[0]&0x10 != 0 {         // extension bit
+		if len(p) < off+4 {
+			return 0, 0, false
+		}
+		off += 4 + 4*int(binary.BigEndian.Uint16(p[off+2:off+4]))
+	}
+	if off > len(p) {
+		return 0, 0, false
+	}
+	end := len(p)
+	if p[0]&0x20 != 0 && end > off { // padding bit: last byte = pad count
+		pad := int(p[end-1])
+		if pad > end-off {
+			return 0, 0, false
+		}
+		end -= pad
+	}
+	return off, end - off, true
+}
 
 const (
 	keepaliveEvery = 1 * time.Second
@@ -98,25 +126,30 @@ func runTunnel(ctx context.Context, p *peer, dev io.ReadWriteCloser) error {
 		}
 	}()
 
-	// RTP -> dev
+	// RTP -> dev. Read (not ReadRTP) into one reused buffer: ReadRTP
+	// allocates a receiveMTU slice plus an rtp.Packet per packet; the
+	// payload offset is parsed manually and dev.Write is a synchronous
+	// syscall, so the buffer is safely reusable right after it returns.
 	go func() {
+		b := make([]byte, 2048) // > our max UDP payload (~1420)
 		for {
-			pkt, _, err := remote.ReadRTP()
+			n, _, err := remote.Read(b)
 			if err != nil {
 				errCh <- err
 				return
 			}
-			if len(pkt.Payload) < 2 {
-				c.rxJunk.Add(1) // keepalive
+			off, plen, ok := rtpPayload(b[:n])
+			if !ok || plen < 2 {
+				c.rxJunk.Add(1) // keepalive or malformed
 				continue
 			}
-			lg.Debug("rx rtp", "seq", pkt.SequenceNumber, "len", len(pkt.Payload), "marker", pkt.Marker, "ssrc", pkt.SSRC)
-			if _, err := dev.Write(pkt.Payload); err != nil {
+			lg.Debug("rx rtp", "seq", binary.BigEndian.Uint16(b[2:4]), "len", plen)
+			if _, err := dev.Write(b[off : off+plen]); err != nil {
 				errCh <- err
 				return
 			}
 			c.rxFrames.Add(1)
-			c.rxBytes.Add(uint64(len(pkt.Payload)))
+			c.rxBytes.Add(uint64(plen))
 		}
 	}()
 
