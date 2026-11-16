@@ -23,7 +23,9 @@ EnvironmentFile=/etc/calltun/%i.env
 #                               wins over NO_IF; for multi-link hosts)
 ExecStart=/usr/local/bin/calltun up --link %i --dev %i --mode tun --ssh ${SSH_ALIAS}
 ExecStartPost=/bin/sh -c 'i=0; until [ "$(cat /sys/class/net/%i/carrier 2>/dev/null)" = 1 ]; do i=$((i+1)); [ $i -ge 30 ] && exit 1; sleep 1; done'
-Restart=on-failure
+Restart=always
+# on-failure misses our clean SIGTERM exit (0); always keeps the link up
+# across external kills, systemctl stop still stops for real.
 RestartSec=3
 
 [Install]
