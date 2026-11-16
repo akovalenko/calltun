@@ -11,6 +11,9 @@ BindsTo=sys-subsystem-net-devices-%i.device
 PartOf=networking.service
 
 [Service]
+# No ExecStartPost carrier gate: carrier means "daemon attached the fd"
+# (the first milliseconds of ExecStart), not "link connected" — for ssh -w
+# it caught an async attach that calltun does not have.
 User=calltun
 Group=calltun
 # NO RuntimeDirectory here on purpose: it is NOT reference-counted across
@@ -24,7 +27,6 @@ ExecStartPre=+/usr/bin/install -d -m0755 -o calltun -g calltun /run/calltun
 EnvironmentFile=-/etc/calltun/%i.env
 ExecStart=/usr/local/bin/calltun accept --link %i --dev %i --mode tun
 # Started only once the carrier is up (we attached):
-ExecStartPost=/bin/sh -c 'i=0; until [ "$(cat /sys/class/net/%i/carrier 2>/dev/null)" = 1 ]; do i=$((i+1)); [ $i -ge 30 ] && exit 1; sleep 1; done'
 Restart=always
 # on-failure misses our clean SIGTERM exit (0); always keeps the link up
 # across external kills, systemctl stop still stops for real.
