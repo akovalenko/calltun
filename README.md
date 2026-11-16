@@ -23,6 +23,14 @@ travels over SSH, so the DTLS fingerprint arrives without a MITM surface.
 
 ## Modes
 
+- `calltun exit --link NAME --tunnel-addr 10.x.y.z --ssh ... [-- <ssh args>]`
+  (userspace build only: `go build -tags userspace`) — the "clean box"
+  side: one binary, no root, no TUN. Frames from the link feed a gVisor
+  netstack with address spoofing; TCP/UDP flows to any destination
+  terminate in userspace and re-originate as real dials (tun2socks-style
+  exit). UDP is a session NAT with idle expiry; ICMP is not forwarded.
+  Everything after `--` goes to ssh verbatim (jump hosts, ports, keys) —
+  also in `up`.
 - `calltun up --link NAME --ssh ALIAS [--offer-cmd calltun]` — initiator
   daemon: spawns `ssh ALIAS calltun offer --link NAME` per attempt,
   exchanges offer/answer (non-trickle), waits for ICE to connect, then the
