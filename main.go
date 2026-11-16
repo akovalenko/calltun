@@ -49,6 +49,8 @@ func main() {
 		err = cmdAccept(ctx, os.Args[2:])
 	case "offer":
 		err = cmdOffer(ctx, os.Args[2:])
+	case "exit":
+		err = cmdExit(ctx, os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "calltun: unknown subcommand %q\n", os.Args[1])
 		usage()

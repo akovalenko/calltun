@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -27,15 +28,18 @@ func cmdUp(ctx context.Context, args []string) error {
 	var c commonFlags
 	var sshAlias, offerCmd, noIf, pinIf string
 	registerCommon(fs, &c)
-	fs.StringVar(&sshAlias, "ssh", "", "ssh destination (alias from ssh_config); required")
+	fs.StringVar(&sshAlias, "ssh", "", "ssh destination (alias from ssh_config); xor with a destination in the trailing args")
 	fs.StringVar(&offerCmd, "offer-cmd", "calltun", "remote calltun binary (path or command) for the offer bridge")
 	fs.StringVar(&noIf, "no-if", "", "comma list of interfaces to never gather ICE candidates on (default: --dev)")
 	fs.StringVar(&pinIf, "if", "", "pin ICE candidates to these interfaces ONLY (overrides --no-if)")
 	fs.Parse(args)
+	// Everything after "--" goes to ssh verbatim (options and/or the
+	// destination): -J hop, -p port, -i key, ProxyJump garlands.
+	extraSSH := fs.Args()
 	initLog(c.verbose)
 
-	if sshAlias == "" {
-		return fmt.Errorf("--ssh is required")
+	if sshAlias == "" && len(extraSSH) == 0 {
+		return fmt.Errorf("--ssh (or a destination in the trailing args after --) is required")
 	}
 	name, tap, err := resolveDevice(&c)
 	if err != nil {
@@ -44,7 +48,7 @@ func cmdUp(ctx context.Context, args []string) error {
 	if pins := pinnedIfaces(pinIf, name); containsStr(pins, name) {
 		return fmt.Errorf("--if must not include the served device %s (media would loop into its own reader)", name)
 	}
-	lg.Info("calltun up starting", "link", c.link, "dev", name, "mode", modeName(tap), "ssh", sshAlias)
+	lg.Info("calltun up starting", "link", c.link, "dev", name, "mode", modeName(tap), "ssh", sshAlias, "ssh_extra", len(extraSSH))
 
 	dev, err := attachDevice(name, tap)
 	if err != nil {
@@ -53,36 +57,55 @@ func cmdUp(ctx context.Context, args []string) error {
 	defer dev.Close()
 	lg.Info("device attached", "dev", name)
 
-	pins := pinnedIfaces(pinIf, name)
-	p, err := newPeer(stunURLs(c.stun), excludedIfaces(noIf, name), pins)
+	p, err := initiatorSession(ctx, &c, sshAlias, extraSSH, offerCmd, name, pinIf, excludedIfaces(noIf, name))
 	if err != nil {
 		return err
 	}
+	return runTunnel(ctx, p, dev)
+}
+
+// initiatorSession brings an initiator from zero to an established link:
+// the peer is built, the ssh signaling transport spawned (extraSSH args go
+// to ssh verbatim before the destination — jump hosts, ports, keys), the
+// offer/answer exchanged, and the transport torn down. On success the
+// returned peer has a live data plane and needs no signaling anymore.
+func initiatorSession(ctx context.Context, c *commonFlags, sshAlias string, extraSSH []string, offerCmd, dev, pinIf string, excluded []string) (*peer, error) {
+	pins := pinnedIfaces(pinIf, dev)
+	p, err := newPeer(stunURLs(c.stun), excluded, pins)
+	if err != nil {
+		return nil, err
+	}
 	iceWait, err := time.ParseDuration(c.iceWait)
 	if err != nil {
-		return fmt.Errorf("--ice-timeout: %w", err)
+		return nil, fmt.Errorf("--ice-timeout: %w", err)
 	}
 	sctx, cancel := context.WithTimeout(ctx, sigSessionTimeout+iceWait)
 	defer cancel()
 
 	// Spawn the SSH signaling transport: the peer runs `offer`, a dumb
-	// stdio bridge to its accept daemon's unix socket.
+	// stdio bridge to its accept daemon's unix socket. extraSSH args sit
+	// between our base options and the destination, so a full ssh garland
+	// (-J hop, -p, -i, ...) works; the destination may live there instead
+	// of --ssh.
 	remoteCmd := fmt.Sprintf("%s offer --link %s", offerCmd, c.link)
-	cmd := exec.Command("ssh",
-		"-o", "BatchMode=yes",
-		"-o", "ConnectTimeout=15",
-		sshAlias, remoteCmd)
+	argv := []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=15"}
+	argv = append(argv, extraSSH...)
+	if sshAlias != "" {
+		argv = append(argv, sshAlias)
+	}
+	argv = append(argv, remoteCmd)
+	cmd := exec.Command("ssh", argv...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("spawn ssh %s: %w", sshAlias, err)
+		return nil, fmt.Errorf("spawn ssh: %w", err)
 	}
 
 	sess := newSigConn(readWriteCloser{Reader: stdout, Writer: stdin, Closer: stdin})
@@ -99,11 +122,10 @@ func cmdUp(ctx context.Context, args []string) error {
 		_ = cmd.Process.Kill()
 	}
 	if sigErr != nil {
-		return fmt.Errorf("signaling: %w", sigErr)
+		return nil, fmt.Errorf("signaling: %w", sigErr)
 	}
 	lg.Info("signaling complete, ssh transport closed")
-
-	return runTunnel(ctx, p, dev)
+	return p, nil
 }
 
 func cmdAccept(ctx context.Context, args []string) error {
@@ -147,6 +169,9 @@ func cmdAccept(ctx context.Context, args []string) error {
 	// One signaling session per daemon life: a new link means a fresh unit
 	// run (crash-only). Stale socket files from a previous run are removed.
 	path := sockPath(c.link)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
+	}
 	_ = os.Remove(path)
 	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
 	if err != nil {
