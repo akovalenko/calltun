@@ -13,7 +13,11 @@ PartOf=networking.service
 [Service]
 User=calltun
 Group=calltun
-RuntimeDirectory=calltun
+# NO RuntimeDirectory here on purpose: it is NOT reference-counted across
+# units/instances — stopping one acceptor deletes the shared dir including
+# the OTHER links' sockets (verified on systemd 262). Create it instead,
+# idempotently; /run is tmpfs so leftovers cost nothing.
+ExecStartPre=+/usr/bin/install -d -m0755 -o calltun -g calltun /run/calltun
 # CALLTUN_NO_IF can list extra interfaces to exclude (comma list);
 # CALLTUN_IF=eth0 pins gathering to specific interfaces (wins) — with
 # several fallback links on one acceptor, pin each side's WAN interface.
