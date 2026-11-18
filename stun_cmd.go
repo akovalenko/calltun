@@ -138,5 +138,60 @@ func cmdStunProbe(ctx context.Context, args []string) error {
 	if okCount == 0 {
 		os.Exit(1)
 	}
+
+	// Phase 2: ONE socket against several servers — the mapping
+	// comparison that classifies the NAT (the parallel probes above each
+	// use their own socket, so their ports are never comparable).
+	var reachable []string
+	for _, r := range all {
+		if r.ok && len(reachable) < 4 {
+			reachable = append(reachable, r.server)
+		}
+	}
+	fmt.Println("--- same-socket pass (NAT classification):")
+	conn, err := net.ListenPacket("udp", ":0")
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	seen := map[string]bool{}
+	for _, srv := range reachable {
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+		var txid [12]byte
+		rand.Read(txid[:])
+		req := make([]byte, 20)
+		binary.BigEndian.PutUint16(req[0:2], 0x0001)
+		binary.BigEndian.PutUint32(req[4:8], 0x2112A442)
+		copy(req[8:20], txid[:])
+		raddr, err := net.ResolveUDPAddr("udp", srv)
+		if err != nil {
+			continue
+		}
+		if _, err := conn.WriteTo(req, raddr); err != nil {
+			continue
+		}
+		buf := make([]byte, 1024)
+		n, _, err := conn.ReadFrom(buf)
+		if err != nil {
+			fmt.Printf("     %-32s no response\n", srv)
+			continue
+		}
+		ip, port, perr := parseSTUNResponse(buf[:n], req[4:8])
+		if perr != nil {
+			fmt.Printf("     %-32s %s\n", srv, perr)
+			continue
+		}
+		m := fmt.Sprintf("%s:%d", ip, port)
+		seen[m] = true
+		fmt.Printf("     %-32s %s\n", srv, m)
+	}
+	switch len(seen) {
+	case 0:
+		fmt.Println("NAT: no classification (no same-socket responses)")
+	case 1:
+		fmt.Println("NAT: mapping consistent across destinations -> endpoint-independent (cone; hole punching viable)")
+	default:
+		fmt.Println("NAT: mapping varies per destination -> endpoint-dependent (symmetric; direct punch unlikely)")
+	}
 	return nil
 }
