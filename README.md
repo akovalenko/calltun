@@ -42,8 +42,10 @@ travels over SSH, so the DTLS fingerprint arrives without a MITM surface.
   command) between the ssh session and the accept daemon's socket.
 
 Common flags: `--dev` (default `--link`), `--mode tun|tap` (default by
-device-name prefix), `--stun LIST` (default `stun.l.google.com:19302`,
-`none` = host candidates only), `--ice-timeout`, `-v`.
+device-name prefix), `--stun LIST` (default `stun.cloudflare.com:3478`;
+`none` = host candidates only). Google STUN got selectively blocked from
+one of our production ISPs with no other UDP impact — anycast Cloudflare
+held up everywhere, `--ice-timeout`, `-v`.
 `--no-if A,B` — interfaces never to gather ICE candidates on (defaults to
 the served device; see "candidate exclusion" below). `CALLTUN_NO_IF` is
 the env fallback for unit-driven daemons. `--if eth0` (env `CALLTUN_IF`)

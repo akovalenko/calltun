@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	defaultSTUN = "stun.l.google.com:19302"
+	defaultSTUN = "stun.cloudflare.com:3478"
 	sockDirEnv  = "CALLTUN_RUN_DIR"
 	sockDirDef  = "/run/calltun"
 )
