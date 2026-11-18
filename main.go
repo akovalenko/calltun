@@ -25,6 +25,9 @@ import (
 )
 
 const (
+	// defaultSTUN kept for compatibility; the real default list lives in
+	// stun.go (defaultSTUNServers). This value is used only when the
+	// collection is somehow empty.
 	defaultSTUN = "stun.cloudflare.com:3478"
 	sockDirEnv  = "CALLTUN_RUN_DIR"
 	sockDirDef  = "/run/calltun"
@@ -51,6 +54,8 @@ func main() {
 		err = cmdOffer(ctx, os.Args[2:])
 	case "exit":
 		err = cmdExit(ctx, os.Args[2:])
+	case "stun-probe":
+		err = cmdStunProbe(ctx, os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "calltun: unknown subcommand %q\n", os.Args[1])
 		usage()

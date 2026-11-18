@@ -71,7 +71,7 @@ func cmdUp(ctx context.Context, args []string) error {
 // returned peer has a live data plane and needs no signaling anymore.
 func initiatorSession(ctx context.Context, c *commonFlags, sshAlias string, extraSSH []string, offerCmd, dev, pinIf string, excluded []string) (*peer, error) {
 	pins := pinnedIfaces(pinIf, dev)
-	p, err := newPeer(stunURLs(c.stun), excluded, pins)
+	p, err := newPeer(stunServers(c.stun), excluded, pins)
 	if err != nil {
 		return nil, err
 	}
@@ -155,7 +155,7 @@ func cmdAccept(ctx context.Context, args []string) error {
 	lg.Info("device attached", "dev", name)
 
 	pins := pinnedIfaces(pinIf, name)
-	p, err := newPeer(stunURLs(c.stun), excludedIfaces(noIf, name), pins)
+	p, err := newPeer(stunServers(c.stun), excludedIfaces(noIf, name), pins)
 	if err != nil {
 		return err
 	}
