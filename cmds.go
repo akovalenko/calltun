@@ -50,7 +50,7 @@ func cmdUp(ctx context.Context, args []string) error {
 	}
 	lg.Info("calltun up starting", "link", c.link, "dev", name, "mode", modeName(tap), "ssh", sshAlias, "ssh_extra", len(extraSSH))
 
-	dev, err := attachDevice(name, tap)
+	dev, err := attachTun(name, tap)
 	if err != nil {
 		return err
 	}
@@ -147,7 +147,7 @@ func cmdAccept(ctx context.Context, args []string) error {
 	}
 	lg.Info("calltun accept starting", "link", c.link, "dev", name, "mode", modeName(tap))
 
-	dev, err := attachDevice(name, tap)
+	dev, err := attachTun(name, tap)
 	if err != nil {
 		return err
 	}

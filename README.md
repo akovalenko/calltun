@@ -54,8 +54,12 @@ the exclusion list and is the robust choice for hosts running several
 links (fallback tunnels on one acceptor): pinning the WAN interface
 makes media loops through sibling tunnels impossible by construction.
 Pin lists containing the served device are refused at startup.
-`CALLTUN_PIONLOG=1` — pion subsystem trace logging; `CALLTUN_OSFILE=1` —
-the os.File tun path, kept as a regression canary.
+`CALLTUN_PIONLOG=1` — pion subsystem trace logging. `CALLTUN_FD=<n>`
+(with `CALLTUN_MTU=<bytes>`) — instead of attaching a device locally,
+adopt the tun/tap descriptor a privileged helper attached elsewhere and
+inherited to us on exec (`nsm tunfd`, see plans/calltun.md): the daemon
+then lives in the underlay namespace while the device — with its
+addresses and the default route — sits inside another one.
 
 ## Deployment sketch
 

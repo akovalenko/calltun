@@ -6,141 +6,110 @@ package main
 // addresses, routes and MTU belong to the host (ifupdown/iproute2); with a
 // persistent device owned by this user no CAP_NET_ADMIN is needed here.
 //
-// The fd is deliberately kept OUT of the os.File/netpoll machinery and
-// read/written with raw blocking syscalls, the same pattern wireguard-go
-// uses. One early bench run saw "read /dev/net/tun: not pollable" (another
-// thread TCGETS2+close on the fd per strace), but a later A/B canary
-// (CALLTUN_OSFILE=1) showed the os.File path passing on go1.26.4 AND
-// go1.27.4, in the same topology — so no Go-version attribution is
-// justified. Raw I/O stays: it is immune to this whole class by design.
+// I/O runs on the runtime netpoller: the descriptor is opened non-blocking
+// up front and wrapped with os.NewFile only AFTER a successful TUNSETIFF —
+// the tun driver only polls an attached fd, and os.NewFile registers a
+// descriptor with the poller only when it is already non-blocking, so both
+// must be true before the wrap (golang/go#30426; the songgao/water order,
+// water/syscalls_linux_go1.11.go). Reads then park the goroutine instead of
+// pinning an OS thread, Close wakes a blocked reader, and deadlines work.
 
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
-type tunFD struct {
-	fd   int
-	name string
-	wrap *osFileWrap // non-nil only in the os.File canary mode
+// attachTun returns the tunnel device handle. CALLTUN_FD (set by an
+// fd-passing helper — `nsm tunfd`, see plans/calltun.md) means the
+// descriptor was already attached to the persistent device inside its own
+// network namespace and inherited here on exec; take it as is. Otherwise
+// attach locally.
+func attachTun(name string, tap bool) (*os.File, error) {
+	if spec := os.Getenv("CALLTUN_FD"); spec != "" {
+		return takeFD(spec, name)
+	}
+	return attachDevice(name, tap)
 }
 
-func attachDevice(name string, tap bool) (*tunFD, error) {
-	if os.Getenv("CALLTUN_OSFILE") != "" {
-		// Regression canary: the os.File/netpoll path (see file comment).
-		return attachDeviceOsFile(name, tap)
-	}
-	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR, 0)
+func attachDevice(name string, tap bool) (*os.File, error) {
+	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open /dev/net/tun (exists? permissions?): %w", err)
 	}
-	flags := uint16(unix.IFF_TUN | unix.IFF_NO_PI)
-	if tap {
-		flags = unix.IFF_TAP | unix.IFF_NO_PI
-	}
-	var ifr [unix.IFNAMSIZ + 2]byte
-	copy(ifr[:unix.IFNAMSIZ-1], name)
-	*(*uint16)(unsafe.Pointer(&ifr[unix.IFNAMSIZ])) = flags
-	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), unix.TUNSETIFF, uintptr(unsafe.Pointer(&ifr[0])))
-	if errno != 0 {
+	if err := tunSetIFF(fd, name, tap); err != nil {
 		unix.Close(fd)
-		switch errno {
-		case unix.EPERM:
-			return nil, fmt.Errorf("attach %s: EPERM (device exists and owned by this user?)", name)
-		case unix.ENODEV:
-			return nil, fmt.Errorf("attach %s: no such device (create it first: ip tuntap add)", name)
-		default:
-			return nil, fmt.Errorf("attach %s: %w", name, errno)
-		}
+		return nil, err
 	}
 	// MTU gate: with fire-and-forget framing a frame larger than the
 	// budget would be silently lost — and TCP inside sizes its segments
 	// from the interface MTU, so a whole segment class would die quietly.
 	// Refuse instead: crash-only, the misconfiguration is visible in the
 	// unit log.
-	mtuPath := "/sys/class/net/" + name + "/mtu"
-	if b, err := os.ReadFile(mtuPath); err == nil {
+	if b, err := os.ReadFile("/sys/class/net/" + name + "/mtu"); err == nil {
 		var mtu int
 		if _, err := fmt.Sscanf(string(b), "%d", &mtu); err == nil && mtu > maxFrame {
 			unix.Close(fd)
-			return nil, fmt.Errorf("%s: MTU %d exceeds the fire-and-forget budget %d — set the device MTU to %d or lower",
-				name, mtu, maxFrame, maxFrame)
+			return nil, mtuGateError(name, mtu)
 		}
 	}
-	return &tunFD{fd: fd, name: name}, nil
+	return os.NewFile(uintptr(fd), name), nil
 }
 
-// Read blocks until a frame arrives; raw blocking syscall, no netpoll.
-func (t *tunFD) Read(p []byte) (int, error) {
-	if t.wrap != nil {
-		return t.wrap.Read(p)
+// takeFD adopts a descriptor delivered by a helper. TUNSETIFF already
+// happened on the helper's side (in the device's namespace), so there is
+// nothing to attach here — only the netpoller wrap, in non-blocking mode
+// (see the file comment). The MTU gate reads CALLTUN_MTU: /sys/class/net
+// is namespace-tagged, and this process sits in the underlay namespace,
+// which does not see the device.
+func takeFD(spec, name string) (*os.File, error) {
+	fd, err := strconv.Atoi(spec)
+	if err != nil || fd < 0 {
+		return nil, fmt.Errorf("CALLTUN_FD=%q: want a file descriptor number", spec)
 	}
-	for {
-		n, err := unix.Read(t.fd, p)
-		if err == unix.EINTR {
-			continue
-		}
-		if err != nil {
-			return 0, fmt.Errorf("read %s: %w", t.name, err)
-		}
-		return n, nil
+	if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0); err != nil {
+		return nil, fmt.Errorf("CALLTUN_FD=%d: not an open descriptor: %w", fd, err)
 	}
+	if spec := os.Getenv("CALLTUN_MTU"); spec != "" {
+		if mtu, err := strconv.Atoi(spec); err == nil && mtu > maxFrame {
+			return nil, mtuGateError(name, mtu)
+		}
+	} else {
+		lg.Debug("CALLTUN_MTU not set: MTU gate skipped (helper should deliver it)")
+	}
+	if err := unix.SetNonblock(fd, true); err != nil {
+		return nil, fmt.Errorf("CALLTUN_FD=%d: O_NONBLOCK: %w", fd, err)
+	}
+	return os.NewFile(uintptr(fd), name), nil
 }
 
-// Write sends one frame; TUN writes are all-or-nothing, but loop anyway.
-func (t *tunFD) Write(p []byte) (int, error) {
-	if t.wrap != nil {
-		return t.wrap.Write(p)
-	}
-	written := 0
-	for written < len(p) {
-		n, err := unix.Write(t.fd, p[written:])
-		if err == unix.EINTR {
-			continue
-		}
-		if err != nil {
-			return written, fmt.Errorf("write %s: %w", t.name, err)
-		}
-		written += n
-	}
-	return written, nil
-}
-
-func (t *tunFD) Close() error {
-	if t.wrap != nil {
-		return t.wrap.Close()
-	}
-	return unix.Close(t.fd)
-}
-
-// attachDeviceOsFile is the os.File-based variant kept as a canary for the
-// netpoll/terminal-probe interaction; select it with CALLTUN_OSFILE=1.
-func attachDeviceOsFile(name string, tap bool) (*tunFD, error) {
-	f, err := os.OpenFile("/dev/net/tun", os.O_RDWR, 0)
-	if err != nil {
-		return nil, err
-	}
+// tunSetIFF attaches fd to the named persistent device, tun or tap.
+func tunSetIFF(fd int, name string, tap bool) error {
 	flags := uint16(unix.IFF_TUN | unix.IFF_NO_PI)
 	if tap {
-		flags = unix.IFF_TAP | unix.IFF_NO_PI
+		flags = uint16(unix.IFF_TAP | unix.IFF_NO_PI)
 	}
 	var ifr [unix.IFNAMSIZ + 2]byte
 	copy(ifr[:unix.IFNAMSIZ-1], name)
 	*(*uint16)(unsafe.Pointer(&ifr[unix.IFNAMSIZ])) = flags
-	_, _, errno := unix.Syscall(unix.SYS_IOCTL, f.Fd(), unix.TUNSETIFF, uintptr(unsafe.Pointer(&ifr[0])))
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), unix.TUNSETIFF, uintptr(unsafe.Pointer(&ifr[0])))
 	if errno != 0 {
-		f.Close()
-		return nil, fmt.Errorf("attach %s (osfile): %w", name, errno)
+		switch errno {
+		case unix.EPERM:
+			return fmt.Errorf("attach %s: EPERM (device exists and owned by this user?)", name)
+		case unix.ENODEV:
+			return fmt.Errorf("attach %s: no such device (create it first: ip tuntap add)", name)
+		default:
+			return fmt.Errorf("attach %s: %w", name, errno)
+		}
 	}
-	w := &osFileWrap{f: f}
-	return &tunFD{name: name, wrap: w}, nil
+	return nil
 }
 
-type osFileWrap struct{ f *os.File }
-
-func (w *osFileWrap) Read(p []byte) (int, error)  { return w.f.Read(p) }
-func (w *osFileWrap) Write(p []byte) (int, error) { return w.f.Write(p) }
-func (w *osFileWrap) Close() error                { return w.f.Close() }
+func mtuGateError(name string, mtu int) error {
+	return fmt.Errorf("%s: MTU %d exceeds the fire-and-forget budget %d — set the device MTU to %d or lower",
+		name, mtu, maxFrame, maxFrame)
+}
