@@ -189,9 +189,9 @@ func cmdStunProbe(ctx context.Context, args []string) error {
 	case 0:
 		fmt.Println("NAT: no classification (no same-socket responses)")
 	case 1:
-		fmt.Println("NAT: mapping consistent across destinations -> endpoint-independent (cone; hole punching viable)")
+		fmt.Println("NAT: mapping consistent across destinations -> endpoint-independent (cone; punches with anyone incl. symmetric peers via prflx)")
 	default:
-		fmt.Println("NAT: mapping varies per destination -> endpoint-dependent (symmetric; direct punch unlikely)")
+		fmt.Println("NAT: mapping varies per destination -> endpoint-dependent (symmetric; still punches vs a CONE peer via prflx; only symmetric x symmetric fails)")
 	}
 	return nil
 }
