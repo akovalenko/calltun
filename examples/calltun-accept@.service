@@ -16,11 +16,15 @@ PartOf=networking.service
 # it caught an async attach that calltun does not have.
 User=calltun
 Group=calltun
-# NO RuntimeDirectory here on purpose: it is NOT reference-counted across
-# units/instances — stopping one acceptor deletes the shared dir including
-# the OTHER links' sockets (verified on systemd 262). Create it instead,
-# idempotently; /run is tmpfs so leftovers cost nothing.
-ExecStartPre=+/usr/bin/install -d -m0755 -o calltun -g calltun /run/calltun
+# RuntimeDirectory alone is NOT safe for multi-acceptor hosts: it is not
+# reference-counted across units/instances, so stopping ANY acceptor
+# deletes the shared dir together with the other links' sockets
+# (verified on systemd 262). RuntimeDirectoryPreserve=yes fixes exactly
+# that — verified: with it, stopping any of several units sharing the
+# directory (including the last one) leaves the dir intact. /run being
+# tmpfs still cleans everything on boot.
+RuntimeDirectory=calltun
+RuntimeDirectoryPreserve=yes
 # CALLTUN_NO_IF can list extra interfaces to exclude (comma list);
 # CALLTUN_IF=eth0 pins gathering to specific interfaces (wins) — with
 # several fallback links on one acceptor, pin each side's WAN interface.
