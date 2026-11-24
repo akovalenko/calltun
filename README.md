@@ -75,6 +75,10 @@ the exclusion list and is the robust choice for hosts running several
 links (fallback tunnels on one acceptor): pinning the WAN interface
 makes media loops through sibling tunnels impossible by construction.
 Pin lists containing the served device are refused at startup.
+`--forever` (up/accept) — rerun the session in place on any failure,
+attach to tunnel, a fresh signaling exchange each time: the units'
+`Restart=always` without systemd, for manual experiments. External
+SIGTERM is still a clean exit.
 `CALLTUN_PIONLOG=1` — pion subsystem trace logging. `CALLTUN_FD=<n>`
 (with `CALLTUN_MTU=<bytes>`) — instead of attaching a device locally,
 adopt the tun/tap descriptor a privileged helper attached elsewhere and

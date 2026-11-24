@@ -78,6 +78,7 @@ func usage() {
   calltun nostr-keygen FILE                                            mint a nostr identity, print keys
 
 common flags: --link NAME --dev NAME --mode tun|tap --stun LIST --ice-timeout 30s -v
+              --forever (rerun the session in place on failure; systemd-free experiments)
 nostr signaling: --nostr (peer npub/hex; replaces --ssh), --nostr-key (our secret),
 --relays (comma list; default: curated public relays). Signaling rides in NIP-17
 gift wraps, so on the wire it is ordinary nostr DM traffic.
@@ -93,6 +94,7 @@ type commonFlags struct {
 	stun    string
 	iceWait string
 	verbose bool
+	forever bool
 }
 
 func registerCommon(fs *flag.FlagSet, c *commonFlags) {
@@ -102,6 +104,7 @@ func registerCommon(fs *flag.FlagSet, c *commonFlags) {
 	fs.StringVar(&c.stun, "stun", defaultSTUN, `comma list of STUN servers, "none" for host candidates only`)
 	fs.StringVar(&c.iceWait, "ice-timeout", "30s", "how long to wait for ICE to connect after the exchange")
 	fs.BoolVar(&c.verbose, "v", false, "debug logging")
+	fs.BoolVar(&c.forever, "forever", false, "rerun the session in place on any failure (systemd Restart=always without systemd; for experiments)")
 }
 
 func initLog(verbose bool) {

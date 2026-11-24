@@ -54,34 +54,43 @@ func cmdUp(ctx context.Context, args []string) error {
 		return fmt.Errorf("--if must not include the served device %s (media would loop into its own reader)", name)
 	}
 	lg.Info("calltun up starting", "link", c.link, "dev", name, "mode", modeName(tap),
-		"ssh", sshAlias, "ssh_extra", len(extraSSH), "nostr", nf.peer != "")
+		"ssh", sshAlias, "ssh_extra", len(extraSSH), "nostr", nf.peer != "", "forever", c.forever)
 
-	dev, err := attachTun(name, tap)
-	if err != nil {
-		return err
-	}
-	defer dev.Close()
-	lg.Info("device attached", "dev", name)
-
-	var sess sigTransport
-	var teardown func()
-	if nf.peer != "" {
-		fan, err := nostrTransport(&nf)
+	// One run = attach + transport + exchange + tunnel; --forever reruns
+	// the whole thing on any failure, mirroring the unit's Restart=
+	// semantics without systemd (crash-only: a restart is a fresh session).
+	runOnce := func() error {
+		dev, err := attachTun(name, tap)
 		if err != nil {
 			return err
 		}
-		sess = fan
-	} else {
-		sess, teardown, err = sshSignaling(&c, sshAlias, extraSSH, offerCmd)
+		defer dev.Close()
+		lg.Info("device attached", "dev", name)
+
+		var sess sigTransport
+		var teardown func()
+		if nf.peer != "" {
+			fan, err := nostrTransport(&nf)
+			if err != nil {
+				return err
+			}
+			sess = fan
+		} else {
+			sess, teardown, err = sshSignaling(&c, sshAlias, extraSSH, offerCmd)
+			if err != nil {
+				return err
+			}
+		}
+		p, err := initiatorSession(ctx, &c, sess, teardown, name, pinIf, excludedIfaces(noIf, name))
 		if err != nil {
 			return err
 		}
+		return runTunnel(ctx, p, dev)
 	}
-	p, err := initiatorSession(ctx, &c, sess, teardown, name, pinIf, excludedIfaces(noIf, name))
-	if err != nil {
-		return err
+	if c.forever {
+		return runForever(ctx, runOnce)
 	}
-	return runTunnel(ctx, p, dev)
+	return runOnce()
 }
 
 // sshSignaling spawns the SSH signaling transport: the peer runs `offer`,
@@ -173,113 +182,146 @@ func cmdAccept(ctx context.Context, args []string) error {
 	if pins := pinnedIfaces(pinIf, name); containsStr(pins, name) {
 		return fmt.Errorf("--if must not include the served device %s (media would loop into its own reader)", name)
 	}
-	lg.Info("calltun accept starting", "link", c.link, "dev", name, "mode", modeName(tap), "nostr", nf.peer != "")
+	lg.Info("calltun accept starting", "link", c.link, "dev", name, "mode", modeName(tap),
+		"nostr", nf.peer != "", "forever", c.forever)
 
-	dev, err := attachTun(name, tap)
-	if err != nil {
-		return err
-	}
-	defer dev.Close()
-	lg.Info("device attached", "dev", name)
-
-	pins := pinnedIfaces(pinIf, name)
-	p, err := newPeer(stunServers(c.stun), excludedIfaces(noIf, name), pins)
-	if err != nil {
-		return err
-	}
-	iceWait, err := time.ParseDuration(c.iceWait)
-	if err != nil {
-		return fmt.Errorf("--ice-timeout: %w", err)
-	}
-	sctx, cancel := context.WithTimeout(ctx, sigSessionTimeout+iceWait)
-	defer cancel()
-
-	// Nostr transport: no local socket, no offer bridge — the daemon
-	// itself watches the relay fan for an offer (one session per run,
-	// crash-only, same as the socket path below). The idle wait for an
-	// offer is unbounded (systemd owns restarts, exactly like the ssh
-	// Accept above); the exchange deadline starts when an offer lands.
-	if nf.peer != "" {
-		fan, err := nostrTransport(&nf)
+	// One run = attach + one signaling session + tunnel; --forever reruns
+	// it on any failure, the in-process counterpart of the unit's
+	// Restart= (crash-only: a restart is a fresh session).
+	runOnce := func() error {
+		dev, err := attachTun(name, tap)
 		if err != nil {
 			return err
 		}
-		lg.Info("waiting for signaling", "transport", "nostr")
-		off, err := recvOffer(ctx, fan)
+		defer dev.Close()
+		lg.Info("device attached", "dev", name)
+
+		pins := pinnedIfaces(pinIf, name)
+		p, err := newPeer(stunServers(c.stun), excludedIfaces(noIf, name), pins)
 		if err != nil {
-			fan.Close()
-			return fmt.Errorf("signaling: %w", err)
+			return err
 		}
-		xc, xcancel := context.WithTimeout(ctx, sigSessionTimeout+iceWait)
-		defer xcancel()
-		// A newer offer than the adopted one means the initiator moved
-		// on — abort at once instead of burning the ICE wait on a zombie
-		// exchange; the systemd restart answers the fresh one.
-		go func() {
-			select {
-			case <-fan.Superseded():
-				lg.Warn("nostr: session superseded by a newer offer")
-				xcancel()
-			case <-xc.Done():
+		iceWait, err := time.ParseDuration(c.iceWait)
+		if err != nil {
+			return fmt.Errorf("--ice-timeout: %w", err)
+		}
+		sctx, cancel := context.WithTimeout(ctx, sigSessionTimeout+iceWait)
+		defer cancel()
+
+		// Nostr transport: no local socket, no offer bridge — the daemon
+		// itself watches the relay fan for an offer (one session per run,
+		// crash-only, same as the socket path below). The idle wait for an
+		// offer is unbounded (restarts are somebody else's job, exactly
+		// like the ssh Accept below); the exchange deadline starts when an
+		// offer lands.
+		if nf.peer != "" {
+			fan, err := nostrTransport(&nf)
+			if err != nil {
+				return err
 			}
+			lg.Info("waiting for signaling", "transport", "nostr")
+			off, err := recvOffer(ctx, fan)
+			if err != nil {
+				fan.Close()
+				return fmt.Errorf("signaling: %w", err)
+			}
+			xc, xcancel := context.WithTimeout(ctx, sigSessionTimeout+iceWait)
+			defer xcancel()
+			// A newer offer than the adopted one means the initiator moved
+			// on — abort at once instead of burning the ICE wait on a zombie
+			// exchange; the restart (systemd or --forever) answers the
+			// fresh one.
+			go func() {
+				select {
+				case <-fan.Superseded():
+					lg.Warn("nostr: session superseded by a newer offer")
+					xcancel()
+				case <-xc.Done():
+				}
+			}()
+			sigErr := responderExchange(xc, fan, p, off)
+			fan.Close()
+			if sigErr != nil {
+				return fmt.Errorf("signaling: %w", sigErr)
+			}
+			lg.Info("signaling complete, fan closed")
+			return runTunnel(ctx, p, dev)
+		}
+
+		// One signaling session per daemon life: a new link means a fresh unit
+		// run (crash-only). Stale socket files from a previous run are removed.
+		path := sockPath(c.link)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
+		}
+		_ = os.Remove(path)
+		ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+		if err != nil {
+			return fmt.Errorf("listen %s: %w", path, err)
+		}
+		defer os.Remove(path)
+
+		connCh := make(chan net.Conn, 1)
+		errCh := make(chan error, 1)
+		go func() {
+			conn, err := ln.Accept()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			// One session per daemon life (crash-only). Closing the listener
+			// right away REFUSES later dialers instead of parking them in the
+			// listen backlog where nobody would ever read them — a wedged
+			// initiator then fails fast and systemd retries both ends.
+			ln.Close()
+			connCh <- conn
 		}()
-		sigErr := responderExchange(xc, fan, p, off)
-		fan.Close()
+		lg.Info("waiting for signaling", "socket", path)
+
+		var conn net.Conn
+		select {
+		case conn = <-connCh:
+		case err := <-errCh:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+		sess := newSigConn(conn)
+		sigErr := signalResponder(sctx, sess, p)
+		sess.Close()
 		if sigErr != nil {
 			return fmt.Errorf("signaling: %w", sigErr)
 		}
-		lg.Info("signaling complete, fan closed")
+		lg.Info("signaling complete, session closed")
+
 		return runTunnel(ctx, p, dev)
 	}
-
-	// One signaling session per daemon life: a new link means a fresh unit
-	// run (crash-only). Stale socket files from a previous run are removed.
-	path := sockPath(c.link)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
+	if c.forever {
+		return runForever(ctx, runOnce)
 	}
-	_ = os.Remove(path)
-	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
-	if err != nil {
-		return fmt.Errorf("listen %s: %w", path, err)
-	}
-	defer os.Remove(path)
+	return runOnce()
+}
 
-	connCh := make(chan net.Conn, 1)
-	errCh := make(chan error, 1)
-	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			errCh <- err
-			return
+// runForever reruns fn until it returns nil or ctx is done — the
+// in-process counterpart of the units' Restart=always (crash-only: every
+// failure path is a fresh session, from device attach to tunnel). An
+// external stop is a clean exit (exit code 0), same as under systemd;
+// restartPause keeps a hard-failing fn from spinning hot.
+func runForever(ctx context.Context, fn func() error) error {
+	const restartPause = time.Second
+	for attempt := 1; ; attempt++ {
+		err := fn()
+		if err == nil || ctx.Err() != nil {
+			return nil
 		}
-		// One session per daemon life (crash-only). Closing the listener
-		// right away REFUSES later dialers instead of parking them in the
-		// listen backlog where nobody would ever read them — a wedged
-		// initiator then fails fast and systemd retries both ends.
-		ln.Close()
-		connCh <- conn
-	}()
-	lg.Info("waiting for signaling", "socket", path)
-
-	var conn net.Conn
-	select {
-	case conn = <-connCh:
-	case err := <-errCh:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
+		lg.Warn("run failed, restarting in place", "attempt", attempt, "err", err)
+		select {
+		case <-time.After(restartPause):
+		case <-ctx.Done():
+			return nil
+		}
 	}
-
-	sess := newSigConn(conn)
-	sigErr := signalResponder(sctx, sess, p)
-	sess.Close()
-	if sigErr != nil {
-		return fmt.Errorf("signaling: %w", sigErr)
-	}
-	lg.Info("signaling complete, session closed")
-
-	return runTunnel(ctx, p, dev)
 }
 
 func cmdOffer(ctx context.Context, args []string) error {
