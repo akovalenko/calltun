@@ -143,14 +143,31 @@ func signalInitiator(ctx context.Context, c sigTransport, p *peer) error {
 }
 
 // signalResponder is the accept-daemon half, symmetric to signalInitiator.
+// Split into recvOffer + responderExchange: the nostr accept path waits
+// for an offer under an unbounded context (like the ssh socket Accept)
+// and mints the exchange deadline only when one lands.
 func signalResponder(ctx context.Context, c sigTransport, p *peer) error {
+	off, err := recvOffer(ctx, c)
+	if err != nil {
+		return err
+	}
+	return responderExchange(ctx, c, p, off)
+}
+
+// recvOffer waits for the offer message and rejects anything else.
+func recvOffer(ctx context.Context, c sigTransport) (sigMsg, error) {
 	off, err := c.recvCtx(ctx)
 	if err != nil {
-		return fmt.Errorf("recv offer: %w", err)
+		return sigMsg{}, fmt.Errorf("recv offer: %w", err)
 	}
 	if off.Type != "offer" {
-		return sendAbortf(c, off.Attempt, "expected offer, got %q", off.Type)
+		return sigMsg{}, sendAbortf(c, off.Attempt, "expected offer, got %q", off.Type)
 	}
+	return off, nil
+}
+
+// responderExchange answers the offer and brings the link up.
+func responderExchange(ctx context.Context, c sigTransport, p *peer, off sigMsg) error {
 	if err := p.pc.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeOffer, SDP: off.SDP,
 	}); err != nil {

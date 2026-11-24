@@ -50,19 +50,28 @@ const (
 	offerTTL = 10 * time.Minute
 
 	// offerSettle: when a responder's subscription backfills several
-	// offers (an initiator's systemd retries pile up on the relays), wait
-	// for this much quiet after the first one and answer the newest.
-	offerSettle = 1500 * time.Millisecond
+	// offers (an initiator's systemd retries pile up on the relays),
+	// debounce — answer the newest after this much quiet since the LAST
+	// offer, capped by offerSettleMax from the first.
+	offerSettle    = 1500 * time.Millisecond
+	offerSettleMax = 4 * time.Second
+
+	// publishStraggler: once one relay has accepted, wait at most this
+	// long for the rest before moving on — a dead relay in the fan must
+	// not add its connect timeout to every publish.
+	publishStraggler = 2 * time.Second
 
 	publishTimeout  = 15 * time.Second
 	relayBackoffMax = 30 * time.Second
 	relayLiveReset  = time.Minute // connected this long -> backoff resets
 )
 
-// defaultNostrRelays — curated like the STUN list: stable free public
-// relays that store kind 1059 without NIP-42 auth (proven live by the
-// tclnostr DM smoke, 2026-07). Override with --relays.
-const defaultNostrRelays = "wss://relay.damus.io,wss://nos.lol"
+// defaultNostrRelays — curated like the STUN list: free public relays
+// that serve kind 1059 both ways without NIP-42 auth, verified live by
+// an empirical probe (read EOSE + publish OK, throwaway keys) on
+// 2026-11-24; relay.damus.io — down (503) that day. Candidates that
+// also passed: nostr.mom, relay.noswhere.com. Override with --relays.
+const defaultNostrRelays = "wss://relay.primal.net,wss://nos.lol,wss://purplerelay.com"
 
 // nostrFlags carries the nostr transport flags, shared by up and accept.
 // --nostr (the peer's key) selects the nostr transport; xor with --ssh.
@@ -104,9 +113,13 @@ type nostrFan struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	mu      sync.Mutex
-	attempt string              // "" until adopted; then the only attempt recv passes
-	seen    map[string]struct{} // rumor ids already ingested
+	mu        sync.Mutex
+	attempt   string              // "" until adopted; then the only attempt recv passes
+	attemptAt time.Time           // created_at of the adopted offer
+	seen      map[string]struct{} // rumor ids already ingested
+
+	supersedeOnce sync.Once
+	supersede     chan struct{} // closed when an offer NEWER than the adopted one arrives
 }
 
 func newNostrFan(sk, peer string, relays []string) (*nostrFan, error) {
@@ -116,8 +129,9 @@ func newNostrFan(sk, peer string, relays []string) (*nostrFan, error) {
 	}
 	f := &nostrFan{
 		sk: sk, pub: pub, peer: peer, relays: relays,
-		events: make(chan fanEvent, 64),
-		seen:   make(map[string]struct{}),
+		events:    make(chan fanEvent, 64),
+		seen:      make(map[string]struct{}),
+		supersede: make(chan struct{}),
 	}
 	f.ctx, f.cancel = context.WithCancel(context.Background())
 	for _, url := range relays {
@@ -235,7 +249,20 @@ func (f *nostrFan) ingest(ev *nostr.Event) (fe fanEvent, drop bool) {
 		lg.Debug("nostr: rumor content not a signaling message", "err", err)
 		return fe, true
 	}
-	return fanEvent{msg: m, at: rumor.CreatedAt.Time()}, false
+	fe = fanEvent{msg: m, at: rumor.CreatedAt.Time()}
+	// Supersede detection lives here, not in recvEvent: during the ICE
+	// wait nobody reads the channel, so a newer offer must raise the
+	// signal from the reader path. An offer from the peer newer than the
+	// one we adopted means the initiator has moved on — our session is a
+	// zombie; the caller aborts and the restart answers the fresh one.
+	f.mu.Lock()
+	adopted, adoptedAt := f.attempt, f.attemptAt
+	f.mu.Unlock()
+	if adopted != "" && m.Type == "offer" && !fe.at.Before(adoptedAt) {
+		f.markSuperseded()
+		lg.Warn("nostr: newer offer arrived, session superseded", "attempt", m.Attempt)
+	}
+	return fe, false
 }
 
 // wrapSignal gift-wraps a signaling message addressed to the peer; the
@@ -274,7 +301,7 @@ func (f *nostrFan) send(m sigMsg) error {
 		// A re-offer is a new exchange: the fan follows the LATEST attempt
 		// it sent. Normally one offer per process (crash-only), but the
 		// fan stays correct if reused across attempts.
-		f.setAttempt(m.Attempt)
+		f.setAttempt(m.Attempt, nostr.Now().Time())
 	}
 
 	fanCtx, cancel := context.WithTimeout(context.Background(), publishTimeout)
@@ -299,13 +326,32 @@ func (f *nostrFan) send(m sigMsg) error {
 		}(url)
 	}
 	var lastErr error
-	accepted := 0
-	for range f.relays {
-		if r := <-resCh; r.err != nil {
-			lg.Warn("nostr publish failed", "relay", r.url, "err", r.err)
-			lastErr = r.err
-		} else {
-			accepted++
+	accepted, done := 0, 0
+	// Once one relay has accepted, wait at most publishStraggler for the
+	// rest — a dead relay must not add its connect timeout to every
+	// publish while the exchange is already provably delivered.
+	straggler := time.NewTimer(time.Hour)
+	if !straggler.Stop() {
+		<-straggler.C
+	}
+	defer straggler.Stop()
+	for done < len(f.relays) {
+		select {
+		case r := <-resCh:
+			done++
+			if r.err != nil {
+				lg.Warn("nostr publish failed", "relay", r.url, "err", r.err)
+				lastErr = r.err
+			} else {
+				if accepted == 0 {
+					straggler.Reset(publishStraggler)
+				}
+				accepted++
+			}
+		case <-straggler.C:
+			lg.Debug("nostr publish: moving on (first accept + grace)",
+				"accepted", accepted, "of", len(f.relays))
+			return nil
 		}
 	}
 	if accepted == 0 {
@@ -326,19 +372,28 @@ func (f *nostrFan) recvCtx(ctx context.Context) (sigMsg, error) {
 
 // recvEvent implements the fan's correlation policy on the merged event
 // channel:
-//   - before an attempt is adopted (responder side), offers are buffered
-//     for a short settle window and the NEWEST is delivered — a responder
-//     coming back online finds the initiator's whole retry pile on the
-//     relays and must answer the live attempt, not an arbitrary old one;
+//   - before an attempt is adopted (responder side), offers are
+//     debounced — the newest is delivered after a short quiet window
+//     since the LAST offer (capped from the first): a responder coming
+//     back online finds the initiator's whole retry pile on the relays
+//     and must answer the live attempt, not an arbitrary old one;
 //   - afterwards, only messages echoing the adopted attempt pass (the
-//     initiator's answer/abort, the responder's ready).
+//     initiator's answer/abort, the responder's ready); an offer NEWER
+//     than the adopted one raises the supersede signal instead — the
+//     initiator has moved on, the current session is a zombie.
 func (f *nostrFan) recvEvent(ctx context.Context) (fanEvent, error) {
 	if f.currentAttempt() != "" {
+		adoptedAt := f.attemptTime()
 		for {
 			select {
 			case fe := <-f.events:
 				if fe.msg.Attempt == f.currentAttempt() {
 					return fe, nil
+				}
+				if fe.msg.Type == "offer" && !fe.at.Before(adoptedAt) {
+					f.markSuperseded()
+					lg.Warn("nostr: newer offer arrived, session superseded", "attempt", fe.msg.Attempt)
+					return fanEvent{}, fmt.Errorf("superseded by newer offer")
 				}
 				lg.Debug("nostr: message for another attempt, dropped", "type", fe.msg.Type)
 			case <-ctx.Done():
@@ -348,13 +403,14 @@ func (f *nostrFan) recvEvent(ctx context.Context) (fanEvent, error) {
 			}
 		}
 	}
-	// Responder awaiting an offer: settle for the newest.
+	// Responder awaiting an offer: debounce for the newest.
 	var best *fanEvent
 	settle := time.NewTimer(time.Hour)
 	if !settle.Stop() {
 		<-settle.C
 	}
 	defer settle.Stop()
+	var first time.Time
 	for {
 		select {
 		case fe := <-f.events:
@@ -363,17 +419,28 @@ func (f *nostrFan) recvEvent(ctx context.Context) (fanEvent, error) {
 				continue
 			}
 			if best == nil {
-				settle.Reset(offerSettle)
+				first = time.Now()
+			} else if time.Since(first) >= offerSettleMax {
+				// cap reached: take this last (newest) one and go
+				if !fe.at.Before(best.at) {
+					best = &fe
+				}
+				f.adoptOffer(best)
+				return *best, nil
 			}
+			// Debounce: restart the quiet window on every offer, so a
+			// live offer arriving right after the backfill is included;
+			// the cap bounds the total wait from the first offer.
+			settle.Reset(offerSettle)
 			// Newest wins, with arrival order breaking same-second ties
 			// (nostr timestamps are second-granular; a later arrival from
-			// the same subscription is the later publication).
+			// the subscription is the later publication).
 			if best == nil || !fe.at.Before(best.at) {
 				best = &fe
 			}
 		case <-settle.C:
 			if best != nil {
-				f.adopt(best.msg.Attempt)
+				f.adoptOffer(best)
 				return *best, nil
 			}
 		case <-ctx.Done():
@@ -390,6 +457,30 @@ func (f *nostrFan) currentAttempt() string {
 	return f.attempt
 }
 
+func (f *nostrFan) attemptTime() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.attemptAt
+}
+
+// adoptOffer adopts the settled offer's attempt as the current exchange.
+func (f *nostrFan) adoptOffer(best *fanEvent) {
+	f.mu.Lock()
+	f.attempt = best.msg.Attempt
+	f.attemptAt = best.at
+	f.mu.Unlock()
+}
+
+// markSuperseded latches the supersede signal (idempotent).
+func (f *nostrFan) markSuperseded() {
+	f.supersedeOnce.Do(func() { close(f.supersede) })
+}
+
+// Superseded fires when an offer newer than the adopted one arrives —
+// the caller should abort the session promptly: answering the zombie
+// burns a full ICE wait for nothing, the restart answers the fresh one.
+func (f *nostrFan) Superseded() <-chan struct{} { return f.supersede }
+
 func (f *nostrFan) adopt(attempt string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -398,14 +489,16 @@ func (f *nostrFan) adopt(attempt string) {
 	}
 }
 
-// setAttempt overwrites the correlation attempt (re-offer supersedes).
-func (f *nostrFan) setAttempt(attempt string) {
+// setAttempt overwrites the correlation attempt (a re-offer supersedes),
+// stamping the new exchange's offer time for supersede comparison.
+func (f *nostrFan) setAttempt(attempt string, at time.Time) {
 	if attempt == "" {
 		return
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.attempt = attempt
+	f.attemptAt = at
 }
 
 func (f *nostrFan) Close() error {

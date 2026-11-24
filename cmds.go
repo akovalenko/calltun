@@ -196,14 +196,34 @@ func cmdAccept(ctx context.Context, args []string) error {
 
 	// Nostr transport: no local socket, no offer bridge — the daemon
 	// itself watches the relay fan for an offer (one session per run,
-	// crash-only, same as the socket path below).
+	// crash-only, same as the socket path below). The idle wait for an
+	// offer is unbounded (systemd owns restarts, exactly like the ssh
+	// Accept above); the exchange deadline starts when an offer lands.
 	if nf.peer != "" {
 		fan, err := nostrTransport(&nf)
 		if err != nil {
 			return err
 		}
 		lg.Info("waiting for signaling", "transport", "nostr")
-		sigErr := signalResponder(sctx, fan, p)
+		off, err := recvOffer(ctx, fan)
+		if err != nil {
+			fan.Close()
+			return fmt.Errorf("signaling: %w", err)
+		}
+		xc, xcancel := context.WithTimeout(ctx, sigSessionTimeout+iceWait)
+		defer xcancel()
+		// A newer offer than the adopted one means the initiator moved
+		// on — abort at once instead of burning the ICE wait on a zombie
+		// exchange; the systemd restart answers the fresh one.
+		go func() {
+			select {
+			case <-fan.Superseded():
+				lg.Warn("nostr: session superseded by a newer offer")
+				xcancel()
+			case <-xc.Done():
+			}
+		}()
+		sigErr := responderExchange(xc, fan, p, off)
 		fan.Close()
 		if sigErr != nil {
 			return fmt.Errorf("signaling: %w", sigErr)

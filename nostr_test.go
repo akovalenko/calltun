@@ -44,9 +44,10 @@ func testFan(t *testing.T) (*nostrFan, *nostrFan) {
 	newF := func(sk, pub, peer string) *nostrFan {
 		return &nostrFan{
 			sk: sk, pub: pub, peer: peer,
-			ctx:    context.Background(),
-			events: make(chan fanEvent, 64),
-			seen:   map[string]struct{}{},
+			ctx:       context.Background(),
+			events:    make(chan fanEvent, 64),
+			seen:      map[string]struct{}{},
+			supersede: make(chan struct{}),
 		}
 	}
 	return newF(skA, pubA, pubB), newF(skB, pubB, pubA)
@@ -178,6 +179,63 @@ func TestNostrAttemptCorrelation(t *testing.T) {
 	}
 }
 
+// TestNostrSupersede: after adopting an offer, a NEWER one from the peer
+// latches the supersede signal (from the ingest path — nobody reads the
+// channel during an ICE wait); an older one does not.
+func TestNostrSupersede(t *testing.T) {
+	fa, fb := testFan(t)
+	now := time.Now()
+
+	// Responder adopts via the settle path.
+	feed(t, fb, fa.sk, fb.pub, sigMsg{Type: "offer", Attempt: "live", SDP: "o1"}, now)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := fb.recvEvent(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Older unseen offer: must NOT supersede (slow backfill from a
+	// second relay arrives after adoption all the time).
+	feed(t, fb, fa.sk, fb.pub, sigMsg{Type: "offer", Attempt: "older", SDP: "o0"}, now.Add(-3*time.Second))
+	select {
+	case <-fb.Superseded():
+		t.Fatal("older offer raised supersede")
+	default:
+	}
+
+	// Newer offer: ingest latches supersede even with nobody reading.
+	feed(t, fb, fa.sk, fb.pub, sigMsg{Type: "offer", Attempt: "newest", SDP: "o2"}, now.Add(2*time.Second))
+	select {
+	case <-fb.Superseded():
+	default:
+		t.Fatal("newer offer did not raise supersede")
+	}
+}
+
+// TestNostrSettleDebounce: an offer arriving within the quiet window
+// extends it — the responder answers the newest, not the first.
+func TestNostrSettleDebounce(t *testing.T) {
+	fa, fb := testFan(t)
+	now := time.Now()
+	feed(t, fb, fa.sk, fb.pub, sigMsg{Type: "offer", Attempt: "first", SDP: "o1"}, now)
+	time.Sleep(800 * time.Millisecond) // inside the 1.5s quiet window
+	feed(t, fb, fa.sk, fb.pub, sigMsg{Type: "offer", Attempt: "second", SDP: "o2"}, now)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	t0 := time.Now()
+	got, err := fb.recvEvent(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(t0)
+	if got.msg.Attempt != "second" {
+		t.Fatalf("debounce did not extend to the newer offer: %+v", got.msg)
+	}
+	if elapsed < 1400*time.Millisecond {
+		t.Fatalf("quiet window did not restart on the second offer: %v", elapsed)
+	}
+}
+
 // TestNostrNakE2E runs the transport against a local `nak serve` relay:
 // offer/answer/ready exchange between two fans, plus duplicate delivery
 // (two subscriptions see the same events) and a superseding offer.
@@ -252,6 +310,17 @@ func TestNostrNakE2E(t *testing.T) {
 	}
 	if m, err := fa.recvCtx(ctx); err != nil || m.Type != "ready" {
 		t.Fatalf("initiator ready: %+v %v", m, err)
+	}
+
+	// A newer offer after adoption latches supersede on the responder,
+	// from the ingest path — nobody is reading fb's channel here.
+	if err := fa.send(sigMsg{Type: "offer", SDP: "o3", Attempt: "a3"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-fb.Superseded():
+	case <-time.After(5 * time.Second):
+		t.Fatal("supersede not latched after a newer offer")
 	}
 }
 
