@@ -6,8 +6,9 @@ flow looks like a video call on the wire. A modest weron counterpart with
 three deliberate differences:
 
 - **signaling is peer-to-peer over SSH** (possibly via tor — that is just
-  an ssh_config alias, calltun knows nothing about tor); no signaling
-  server;
+  an ssh_config alias, calltun knows nothing about tor), **or over nostr**
+  (NIP-17 DMs via a fan of public relays) — no signaling server either
+  way;
 - **no TURN, ever** — the link lives when UDP hole punching works and dies
   (systemd restarts it) when it does not;
 - **media, not data channels**: after the DTLS handshake the wire carries
@@ -20,6 +21,26 @@ The tunnel device is created and configured **externally** (ifupdown /
 iproute2): calltun attaches to an existing persistent TUN/TAP and never
 touches addresses, routes or MTU. Peer authentication comes free: the SDP
 travels over SSH, so the DTLS fingerprint arrives without a MITM surface.
+
+## Signaling over nostr (second transport)
+
+`--nostr PEER --nostr-key FILE` on `up`/`accept` (xor with `--ssh`)
+switches signaling to public nostr relays: offer/answer ride inside
+NIP-17 gift wraps (kind 1059), so on the wire they are ordinary nostr DM
+traffic; the inner rumor kind (21124) is visible only to the peer. Both
+sides configure each other's key (`calltun nostr-keygen FILE` mints one),
+which authenticates the exchange — the seal inside a wrap is signed by
+the sender's real key, checked on unwrap; no MITM surface, same as SSH.
+Relays never sync with each other, so every message is published to ALL
+configured relays and read from whichever are alive (`--relays`, default:
+curated public pair); duplicates drop by event id, exchanges correlate by
+a random attempt id minted per `up` run. Store-and-forward covers short
+responder downtime (offers carry a 10-minute TTL — a stale offer's ICE
+candidates are dead anyway, the initiator retries with a fresh one). A
+responder coming back online backfills the initiator's whole retry pile
+and answers the newest offer after a short settle window. Exchange
+latency: seconds (measured live: 5.3 s offer→answer through
+relay.damus.io + nos.lol).
 
 ## Modes
 

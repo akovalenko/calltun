@@ -1,8 +1,12 @@
 package main
 
-// Signaling: line-delimited JSON over the SSH stdio pipe (up side) and over
-// a local unix socket (offer bridge -> accept daemon). No trickle: each side
-// waits for ICE gathering to complete and sends the whole SDP in one message.
+// Signaling: the offer/answer exchange, transport-agnostic. The two
+// transports are the SSH stdio pipe (up side) or local unix socket (offer
+// bridge -> accept daemon) — sigConn — and the nostr relay fan (nostrFan);
+// both implement sigTransport. No trickle: each side waits for ICE
+// gathering to complete and sends the whole SDP in one message. The
+// Attempt field correlates messages of one exchange on the async nostr
+// transport (the ssh stream correlates implicitly and ignores it).
 
 import (
 	"bufio"
@@ -15,10 +19,18 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
+// sigTransport is the bidirectional message surface an exchange runs on.
+type sigTransport interface {
+	send(m sigMsg) error
+	recvCtx(ctx context.Context) (sigMsg, error)
+	Close() error
+}
+
 type sigMsg struct {
-	Type string `json:"type"`          // offer | answer | ready | abort
-	SDP  string `json:"sdp,omitempty"` // full SDP for offer/answer
-	Err  string `json:"err,omitempty"` // human-readable abort reason
+	Type    string `json:"type"`              // offer | answer | ready | abort
+	SDP     string `json:"sdp,omitempty"`     // full SDP for offer/answer
+	Err     string `json:"err,omitempty"`     // human-readable abort reason
+	Attempt string `json:"attempt,omitempty"` // exchange id: initiator mints, responder echoes
 }
 
 type sigConn struct {
@@ -86,7 +98,7 @@ const sigReadyTimeout = 15 * time.Second
 // signalInitiator runs the offer/answer exchange on the `up` side: send the
 // offer (after gathering), apply the answer, wait for ICE to connect, then
 // a final ready/ready handshake. The transport is closed by the caller.
-func signalInitiator(ctx context.Context, c *sigConn, p *peer) error {
+func signalInitiator(ctx context.Context, c sigTransport, p *peer) error {
 	offer, err := p.pc.CreateOffer(nil)
 	if err != nil {
 		return fmt.Errorf("create offer: %w", err)
@@ -99,10 +111,11 @@ func signalInitiator(ctx context.Context, c *sigConn, p *peer) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	if err := c.send(sigMsg{Type: "offer", SDP: p.pc.LocalDescription().SDP}); err != nil {
+	attempt := newAttemptId()
+	if err := c.send(sigMsg{Type: "offer", SDP: p.pc.LocalDescription().SDP, Attempt: attempt}); err != nil {
 		return fmt.Errorf("send offer: %w", err)
 	}
-	lg.Debug("offer sent", "sdp", p.pc.LocalDescription().SDP)
+	lg.Debug("offer sent", "attempt", attempt, "sdp", p.pc.LocalDescription().SDP)
 
 	ans, err := c.recvCtx(ctx)
 	if err != nil {
@@ -123,71 +136,80 @@ func signalInitiator(ctx context.Context, c *sigConn, p *peer) error {
 	if err := p.waitConnected(ctx); err != nil {
 		return err
 	}
-	if err := c.send(sigMsg{Type: "ready"}); err != nil {
+	if err := c.send(sigMsg{Type: "ready", Attempt: attempt}); err != nil {
 		return fmt.Errorf("send ready: %w", err)
 	}
-	return readyHandshake(ctx, c)
+	return readyHandshake(ctx, c, attempt)
 }
 
 // signalResponder is the accept-daemon half, symmetric to signalInitiator.
-func signalResponder(ctx context.Context, c *sigConn, p *peer) error {
+func signalResponder(ctx context.Context, c sigTransport, p *peer) error {
 	off, err := c.recvCtx(ctx)
 	if err != nil {
 		return fmt.Errorf("recv offer: %w", err)
 	}
 	if off.Type != "offer" {
-		return c.sendAbortf("expected offer, got %q", off.Type)
+		return sendAbortf(c, off.Attempt, "expected offer, got %q", off.Type)
 	}
 	if err := p.pc.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeOffer, SDP: off.SDP,
 	}); err != nil {
-		return c.sendAbortf("bad offer: %v", err)
+		return sendAbortf(c, off.Attempt, "bad offer: %v", err)
 	}
 	answer, err := p.pc.CreateAnswer(nil)
 	if err != nil {
-		return c.sendAbortf("create answer: %v", err)
+		return sendAbortf(c, off.Attempt, "create answer: %v", err)
 	}
 	if err := p.pc.SetLocalDescription(answer); err != nil {
-		return c.sendAbortf("set local description: %v", err)
+		return sendAbortf(c, off.Attempt, "set local description: %v", err)
 	}
 	select {
 	case <-p.gatherDone:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	if err := c.send(sigMsg{Type: "answer", SDP: p.pc.LocalDescription().SDP}); err != nil {
+	if err := c.send(sigMsg{Type: "answer", SDP: p.pc.LocalDescription().SDP, Attempt: off.Attempt}); err != nil {
 		return fmt.Errorf("send answer: %w", err)
 	}
-	lg.Debug("answer sent", "sdp", p.pc.LocalDescription().SDP)
+	lg.Debug("answer sent", "attempt", off.Attempt, "sdp", p.pc.LocalDescription().SDP)
 	if err := p.waitConnected(ctx); err != nil {
 		return err
 	}
-	if err := c.send(sigMsg{Type: "ready"}); err != nil {
+	if err := c.send(sigMsg{Type: "ready", Attempt: off.Attempt}); err != nil {
 		return fmt.Errorf("send ready: %w", err)
 	}
-	return readyHandshake(ctx, c)
+	return readyHandshake(ctx, c, off.Attempt)
 }
 
 // readyHandshake waits for the peer's ready, bounded: both ICE states are
-// already connected, so a missing ready must not wedge the link.
-func readyHandshake(ctx context.Context, c *sigConn) error {
+// already connected, so a missing ready must not wedge the link. On the
+// nostr transport a stray message for another attempt may still surface —
+// warn and keep waiting rather than failing a connected link.
+func readyHandshake(ctx context.Context, c sigTransport, attempt string) error {
 	rctx, cancel := context.WithTimeout(ctx, sigReadyTimeout)
 	defer cancel()
-	m, err := c.recvCtx(rctx)
-	if err == nil && m.Type != "ready" {
-		return fmt.Errorf("expected ready, got %q", m.Type)
+	for {
+		m, err := c.recvCtx(rctx)
+		if err != nil {
+			// Both ICE states are connected; a peer that closed its transport
+			// right after sending ready must not wedge the link.
+			lg.Warn("peer ready not received; proceeding (ICE is connected)", "err", err)
+			return nil
+		}
+		switch m.Type {
+		case "ready":
+			return nil
+		case "abort":
+			return fmt.Errorf("peer aborted: %s", m.Err)
+		default:
+			lg.Warn("unexpected message during ready handshake, ignored", "type", m.Type)
+		}
 	}
-	if err != nil {
-		// Both ICE states are connected; a peer that closed its transport
-		// right after sending ready must not wedge the link.
-		lg.Warn("peer ready not received; proceeding (ICE is connected)", "err", err)
-	}
-	return nil
 }
 
 // sendAbortf reports an error to the peer before failing.
-func (c *sigConn) sendAbortf(format string, args ...any) error {
+func sendAbortf(c sigTransport, attempt string, format string, args ...any) error {
 	msg := fmt.Sprintf(format, args...)
-	_ = c.send(sigMsg{Type: "abort", Err: msg})
+	_ = c.send(sigMsg{Type: "abort", Err: msg, Attempt: attempt})
 	return fmt.Errorf("%s", msg)
 }

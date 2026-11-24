@@ -56,6 +56,8 @@ func main() {
 		err = cmdExit(ctx, os.Args[2:])
 	case "stun-probe":
 		err = cmdStunProbe(ctx, os.Args[2:])
+	case "nostr-keygen":
+		err = cmdNostrKeygen(ctx, os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "calltun: unknown subcommand %q\n", os.Args[1])
 		usage()
@@ -70,10 +72,15 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `usage:
   calltun up     --link NAME --ssh ALIAS [--offer-cmd calltun] [flags]  initiator side
-  calltun accept --link NAME [flags]                                   responder daemon
+  calltun up     --link NAME --nostr PEER --nostr-key FILE [flags]      initiator side, nostr signaling
+  calltun accept --link NAME [--nostr PEER --nostr-key FILE] [flags]    responder daemon
   calltun offer  --link NAME                                           sshd-forced bridge
+  calltun nostr-keygen FILE                                            mint a nostr identity, print keys
 
 common flags: --link NAME --dev NAME --mode tun|tap --stun LIST --ice-timeout 30s -v
+nostr signaling: --nostr (peer npub/hex; replaces --ssh), --nostr-key (our secret),
+--relays (comma list; default: curated public relays). Signaling rides in NIP-17
+gift wraps, so on the wire it is ordinary nostr DM traffic.
 STUN list: comma-separated host[:port] entries, or "none" for host candidates only.
 `)
 }

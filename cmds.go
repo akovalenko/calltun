@@ -26,8 +26,10 @@ const (
 func cmdUp(ctx context.Context, args []string) error {
 	fs := newFlagSet("up")
 	var c commonFlags
+	var nf nostrFlags
 	var sshAlias, offerCmd, noIf, pinIf string
 	registerCommon(fs, &c)
+	nf.register(fs)
 	fs.StringVar(&sshAlias, "ssh", "", "ssh destination (alias from ssh_config); xor with a destination in the trailing args")
 	fs.StringVar(&offerCmd, "offer-cmd", "calltun", "remote calltun binary (path or command) for the offer bridge")
 	fs.StringVar(&noIf, "no-if", "", "comma list of interfaces to never gather ICE candidates on (default: --dev)")
@@ -38,8 +40,11 @@ func cmdUp(ctx context.Context, args []string) error {
 	extraSSH := fs.Args()
 	initLog(c.verbose)
 
-	if sshAlias == "" && len(extraSSH) == 0 {
-		return fmt.Errorf("--ssh (or a destination in the trailing args after --) is required")
+	if nf.peer != "" && (sshAlias != "" || len(extraSSH) > 0) {
+		return fmt.Errorf("--nostr and --ssh are mutually exclusive")
+	}
+	if nf.peer == "" && sshAlias == "" && len(extraSSH) == 0 {
+		return fmt.Errorf("--ssh (or --nostr) is required")
 	}
 	name, tap, err := resolveDevice(&c)
 	if err != nil {
@@ -48,7 +53,8 @@ func cmdUp(ctx context.Context, args []string) error {
 	if pins := pinnedIfaces(pinIf, name); containsStr(pins, name) {
 		return fmt.Errorf("--if must not include the served device %s (media would loop into its own reader)", name)
 	}
-	lg.Info("calltun up starting", "link", c.link, "dev", name, "mode", modeName(tap), "ssh", sshAlias, "ssh_extra", len(extraSSH))
+	lg.Info("calltun up starting", "link", c.link, "dev", name, "mode", modeName(tap),
+		"ssh", sshAlias, "ssh_extra", len(extraSSH), "nostr", nf.peer != "")
 
 	dev, err := attachTun(name, tap)
 	if err != nil {
@@ -57,19 +63,70 @@ func cmdUp(ctx context.Context, args []string) error {
 	defer dev.Close()
 	lg.Info("device attached", "dev", name)
 
-	p, err := initiatorSession(ctx, &c, sshAlias, extraSSH, offerCmd, name, pinIf, excludedIfaces(noIf, name))
+	var sess sigTransport
+	var teardown func()
+	if nf.peer != "" {
+		fan, err := nostrTransport(&nf)
+		if err != nil {
+			return err
+		}
+		sess = fan
+	} else {
+		sess, teardown, err = sshSignaling(&c, sshAlias, extraSSH, offerCmd)
+		if err != nil {
+			return err
+		}
+	}
+	p, err := initiatorSession(ctx, &c, sess, teardown, name, pinIf, excludedIfaces(noIf, name))
 	if err != nil {
 		return err
 	}
 	return runTunnel(ctx, p, dev)
 }
 
+// sshSignaling spawns the SSH signaling transport: the peer runs `offer`,
+// a dumb stdio bridge to its accept daemon's unix socket. extraSSH args
+// sit between our base options and the destination, so a full ssh garland
+// (-J hop, -p, -i, ...) works; the destination may live there instead of
+// --ssh. The returned teardown waits out (then kills) the ssh child.
+func sshSignaling(c *commonFlags, sshAlias string, extraSSH []string, offerCmd string) (sigTransport, func(), error) {
+	remoteCmd := fmt.Sprintf("%s offer --link %s", offerCmd, c.link)
+	argv := []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=15"}
+	argv = append(argv, extraSSH...)
+	if sshAlias != "" {
+		argv = append(argv, sshAlias)
+	}
+	argv = append(argv, remoteCmd)
+	cmd := exec.Command("ssh", argv...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, err
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return nil, nil, fmt.Errorf("spawn ssh: %w", err)
+	}
+	teardown := func() {
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		select {
+		case <-done:
+		case <-time.After(sshTeardownWait):
+			_ = cmd.Process.Kill()
+		}
+	}
+	return newSigConn(readWriteCloser{Reader: stdout, Writer: stdin, Closer: stdin}), teardown, nil
+}
+
 // initiatorSession brings an initiator from zero to an established link:
-// the peer is built, the ssh signaling transport spawned (extraSSH args go
-// to ssh verbatim before the destination — jump hosts, ports, keys), the
-// offer/answer exchanged, and the transport torn down. On success the
-// returned peer has a live data plane and needs no signaling anymore.
-func initiatorSession(ctx context.Context, c *commonFlags, sshAlias string, extraSSH []string, offerCmd, dev, pinIf string, excluded []string) (*peer, error) {
+// the peer is built, the offer/answer exchanged over the given transport,
+// and the transport torn down. On success the returned peer has a live
+// data plane and needs no signaling anymore.
+func initiatorSession(ctx context.Context, c *commonFlags, sess sigTransport, teardown func(), dev, pinIf string, excluded []string) (*peer, error) {
 	pins := pinnedIfaces(pinIf, dev)
 	p, err := newPeer(stunServers(c.stun), excluded, pins)
 	if err != nil {
@@ -82,57 +139,28 @@ func initiatorSession(ctx context.Context, c *commonFlags, sshAlias string, extr
 	sctx, cancel := context.WithTimeout(ctx, sigSessionTimeout+iceWait)
 	defer cancel()
 
-	// Spawn the SSH signaling transport: the peer runs `offer`, a dumb
-	// stdio bridge to its accept daemon's unix socket. extraSSH args sit
-	// between our base options and the destination, so a full ssh garland
-	// (-J hop, -p, -i, ...) works; the destination may live there instead
-	// of --ssh.
-	remoteCmd := fmt.Sprintf("%s offer --link %s", offerCmd, c.link)
-	argv := []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=15"}
-	argv = append(argv, extraSSH...)
-	if sshAlias != "" {
-		argv = append(argv, sshAlias)
-	}
-	argv = append(argv, remoteCmd)
-	cmd := exec.Command("ssh", argv...)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, err
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("spawn ssh: %w", err)
-	}
-
-	sess := newSigConn(readWriteCloser{Reader: stdout, Writer: stdin, Closer: stdin})
 	sigErr := signalInitiator(sctx, sess, p)
 
 	// Tear the signaling transport down regardless of the outcome; after a
 	// successful exchange the link no longer needs it.
 	sess.Close()
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	select {
-	case <-done:
-	case <-time.After(sshTeardownWait):
-		_ = cmd.Process.Kill()
+	if teardown != nil {
+		teardown()
 	}
 	if sigErr != nil {
 		return nil, fmt.Errorf("signaling: %w", sigErr)
 	}
-	lg.Info("signaling complete, ssh transport closed")
+	lg.Info("signaling complete, transport closed")
 	return p, nil
 }
 
 func cmdAccept(ctx context.Context, args []string) error {
 	fs := newFlagSet("accept")
 	var c commonFlags
+	var nf nostrFlags
 	var noIf, pinIf string
 	registerCommon(fs, &c)
+	nf.register(fs)
 	fs.StringVar(&noIf, "no-if", "", "comma list of interfaces to never gather ICE candidates on (default: --dev)")
 	fs.StringVar(&pinIf, "if", "", "pin ICE candidates to these interfaces ONLY (overrides --no-if)")
 	fs.Parse(args)
@@ -145,7 +173,7 @@ func cmdAccept(ctx context.Context, args []string) error {
 	if pins := pinnedIfaces(pinIf, name); containsStr(pins, name) {
 		return fmt.Errorf("--if must not include the served device %s (media would loop into its own reader)", name)
 	}
-	lg.Info("calltun accept starting", "link", c.link, "dev", name, "mode", modeName(tap))
+	lg.Info("calltun accept starting", "link", c.link, "dev", name, "mode", modeName(tap), "nostr", nf.peer != "")
 
 	dev, err := attachTun(name, tap)
 	if err != nil {
@@ -165,6 +193,24 @@ func cmdAccept(ctx context.Context, args []string) error {
 	}
 	sctx, cancel := context.WithTimeout(ctx, sigSessionTimeout+iceWait)
 	defer cancel()
+
+	// Nostr transport: no local socket, no offer bridge — the daemon
+	// itself watches the relay fan for an offer (one session per run,
+	// crash-only, same as the socket path below).
+	if nf.peer != "" {
+		fan, err := nostrTransport(&nf)
+		if err != nil {
+			return err
+		}
+		lg.Info("waiting for signaling", "transport", "nostr")
+		sigErr := signalResponder(sctx, fan, p)
+		fan.Close()
+		if sigErr != nil {
+			return fmt.Errorf("signaling: %w", sigErr)
+		}
+		lg.Info("signaling complete, fan closed")
+		return runTunnel(ctx, p, dev)
+	}
 
 	// One signaling session per daemon life: a new link means a fresh unit
 	// run (crash-only). Stale socket files from a previous run are removed.
