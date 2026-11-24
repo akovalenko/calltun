@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -233,6 +234,28 @@ func TestNostrSettleDebounce(t *testing.T) {
 	}
 	if elapsed < 1400*time.Millisecond {
 		t.Fatalf("quiet window did not restart on the second offer: %v", elapsed)
+	}
+}
+
+// TestNostrWrapSizeGate: an oversized SDP (many-candidate host) fails
+// loudly before publishing, with the --if advice in the message.
+func TestNostrWrapSizeGate(t *testing.T) {
+	fa, _ := testFan(t)
+	fa.relays = nil // the gate must fire before any relay is contacted
+	var big strings.Builder
+	big.WriteString("v=0\r\n")
+	for i := 0; i < 120; i++ {
+		fmt.Fprintf(&big, "a=candidate:%d 1 udp 2130706431 10.231.%d.%d 40000 typ host\r\n", i, i/250, i%250)
+	}
+	err := fa.send(sigMsg{Type: "offer", SDP: big.String(), Attempt: "big"})
+	if err == nil || !strings.Contains(err.Error(), "--if") {
+		t.Fatalf("oversized wrap not gated with advice: %v", err)
+	}
+	// A normal single-interface SDP passes the gate (and fails later at
+	// publish — no relays configured — proving the gate itself let it by).
+	err = fa.send(sigMsg{Type: "offer", SDP: "v=0\r\na=candidate:1 1 udp 1 10.0.0.1 4000 typ host\r\n", Attempt: "ok"})
+	if err == nil || strings.Contains(err.Error(), "--if") {
+		t.Fatalf("normal wrap wrongly gated or unexpectedly published: %v", err)
 	}
 }
 

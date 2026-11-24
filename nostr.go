@@ -64,6 +64,11 @@ const (
 	publishTimeout  = 15 * time.Second
 	relayBackoffMax = 30 * time.Second
 	relayLiveReset  = time.Minute // connected this long -> backoff resets
+
+	// Gift-wrap size gates: the strictest observed public relay
+	// (purplerelay.com) rejects encrypted content over 8192 bytes.
+	wrapContentMax  = 8192
+	wrapContentWarn = 6000
 )
 
 // defaultNostrRelays — curated like the STUN list: free public relays
@@ -296,6 +301,23 @@ func (f *nostrFan) send(m sigMsg) error {
 	if err != nil {
 		return fmt.Errorf("gift wrap: %w", err)
 	}
+
+	// Gift-wrap size gate, the MTU-gate philosophy at the signaling layer:
+	// a many-interface host gathers a candidate per interface, the SDP
+	// bloats, and the strictest public relays reject oversized encrypted
+	// content outright (purplerelay: 8192 bytes, observed live) — while a
+	// multi-KB "DM" is also a fingerprint among ordinary ones. Fail loudly
+	// with the fix (--if) instead of proceeding fragile; warn earlier.
+	cands := strings.Count(m.SDP, "a=candidate:")
+	if n := len(wrap.Content); n > wrapContentMax {
+		return fmt.Errorf("gift wrap is %d bytes, over the relay limit %d (%s: %d ICE candidates) — pin --if to fewer interfaces",
+			n, wrapContentMax, m.Type, cands)
+	}
+	if n := len(wrap.Content); n > wrapContentWarn {
+		lg.Warn("nostr: large gift wrap", "bytes", n, "candidates", cands,
+			"hint", "pin --if to fewer interfaces to stay small")
+	}
+	lg.Debug("nostr: wrap built", "bytes", len(wrap.Content), "candidates", cands, "type", m.Type)
 
 	if m.Type == "offer" {
 		// A re-offer is a new exchange: the fan follows the LATEST attempt
