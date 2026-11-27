@@ -10,7 +10,13 @@ package main
 // (the carefully configured machine) runs a stock accept with a TUN and
 // routes whatever it wants through the link.
 //
+// Signaling is the initiator's, exactly as in up: the exit dials — over
+// ssh (--ssh, the peer's forced command) or nostr (--nostr).
+//
 // ICMP is not forwarded (no ping through the exit); TCP and UDP only.
+// Destinations inside 127/8 are dropped by the netstack on arrival (gVisor's
+// martian filter), so the exit's own loopback services are not reachable
+// through the link.
 
 import (
 	"bytes"
@@ -39,12 +45,22 @@ const (
 	dialTimeout = 15 * time.Second
 )
 
+// exitDial opens the real connection a terminated flow is re-originated as.
+// A variable so the in-process test can aim the dials at the loopback: a
+// sandbox has nothing else, and the netstack itself drops loopback
+// destinations arriving on the NIC as martian packets.
+var exitDial = func(network, addr string) (net.Conn, error) {
+	return (&net.Dialer{Timeout: dialTimeout}).Dial(network, addr)
+}
+
 func cmdExit(ctx context.Context, args []string) error {
 	fs := newFlagSet("exit")
 	var c commonFlags
+	var nf nostrFlags
 	var sshAlias, offerCmd, noIf, pinIf, tunnelAddr string
 	registerCommon(fs, &c)
-	fs.StringVar(&sshAlias, "ssh", "", "ssh destination; xor with a destination in the trailing args after --")
+	nf.register(fs)
+	fs.StringVar(&sshAlias, "ssh", "", "ssh destination (alias from ssh_config); xor with a destination in the trailing args")
 	fs.StringVar(&offerCmd, "offer-cmd", "calltun", "remote calltun binary for the offer bridge")
 	fs.StringVar(&noIf, "no-if", "", "comma list of interfaces to never gather ICE candidates on")
 	fs.StringVar(&pinIf, "if", "", "pin ICE candidates to these interfaces ONLY (overrides --no-if)")
@@ -58,17 +74,23 @@ func cmdExit(ctx context.Context, args []string) error {
 	if tunnelAddr == "" {
 		return fmt.Errorf("--tunnel-addr is required")
 	}
-	if sshAlias == "" && len(extraSSH) == 0 {
-		return fmt.Errorf("--ssh (or a destination in the trailing args after --) is required")
+	if err := checkSignalingFlags(&nf, sshAlias, extraSSH); err != nil {
+		return err
 	}
+	lg.Info("calltun exit starting", "link", c.link, "tunnel-addr", tunnelAddr,
+		"ssh", sshAlias, "ssh_extra", len(extraSSH), "nostr", nf.peer != "")
 
 	dev, err := newExitStack(ctx, tunnelAddr)
 	if err != nil {
 		return err
 	}
-	lg.Info("calltun exit starting", "link", c.link, "tunnel-addr", tunnelAddr, "ssh", sshAlias, "ssh_extra", len(extraSSH))
-
-	p, err := initiatorSession(ctx, &c, sshAlias, extraSSH, offerCmd, c.link, pinIf, splitList(noIf))
+	defer dev.Close()
+	sess, teardown, err := openSignaling(&c, &nf, sshAlias, extraSSH, offerCmd)
+	if err != nil {
+		return err
+	}
+	// No served device: the empty name only means "nothing to self-exclude".
+	p, err := initiatorSession(ctx, &c, sess, teardown, "", pinIf, excludedIfaces(noIf, ""))
 	if err != nil {
 		return err
 	}
@@ -78,6 +100,7 @@ func cmdExit(ctx context.Context, args []string) error {
 // exitStack ties the gVisor stack to a tun-shaped frame device.
 type exitStack struct {
 	ep  *channel.Endpoint
+	s   *stack.Stack
 	ctx context.Context
 }
 
@@ -136,7 +159,7 @@ func newExitStack(ctx context.Context, tunnelAddr string) (*exitStack, error) {
 		forwardUDP(r, dst)
 	})
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
-	return &exitStack{ep: ep, ctx: ctx}, nil
+	return &exitStack{ep: ep, s: s, ctx: ctx}, nil
 }
 
 // Read blocks until the stack emits a frame (return traffic toward the peer).
@@ -183,7 +206,12 @@ func (e *exitStack) Write(frame []byte) (int, error) {
 	return len(frame), nil
 }
 
-func (e *exitStack) Close() error { return nil }
+// Close tears the stack down: its endpoints close, which ends the forwarder
+// sessions and their real dials.
+func (e *exitStack) Close() error {
+	e.s.Close()
+	return nil
+}
 
 // --- connected-endpoint <-> io.ReadWriteCloser adapter ---
 
@@ -195,10 +223,9 @@ type nsStream struct {
 // Read pulls data (a TCP chunk or one UDP datagram) from the endpoint.
 func (s *nsStream) Read(p []byte) (int, error) {
 	for {
-		var buf bytes.Buffer
-		res, err := s.ep.Read(&buf, tcpip.ReadOptions{})
+		n, err := s.readOnce(p)
 		if err == nil {
-			return buf.Read(p)
+			return n, nil
 		}
 		if _, block := err.(*tcpip.ErrWouldBlock); !block {
 			return 0, toErr(err)
@@ -206,11 +233,10 @@ func (s *nsStream) Read(p []byte) (int, error) {
 		entry, ch := waiter.NewChannelEntry(waiter.EventIn | waiter.EventErr | waiter.EventHUp)
 		s.wq.EventRegister(&entry)
 		// Re-check after registering (missed-wakeup dance).
-		var b2 bytes.Buffer
-		res, err = s.ep.Read(&b2, tcpip.ReadOptions{})
+		n, err = s.readOnce(p)
 		if err == nil {
 			s.wq.EventUnregister(&entry)
-			return b2.Read(p)
+			return n, nil
 		}
 		if _, block := err.(*tcpip.ErrWouldBlock); !block {
 			s.wq.EventUnregister(&entry)
@@ -218,8 +244,22 @@ func (s *nsStream) Read(p []byte) (int, error) {
 		}
 		<-ch
 		s.wq.EventUnregister(&entry)
-		_ = res
 	}
+}
+
+// readOnce is one non-blocking read of at most len(p) bytes.
+//
+// The endpoint copies as much as the writer takes, so the writer must be
+// bounded by p. Reading into an unbounded buffer and returning its first
+// len(p) bytes — as this used to — dropped the rest: a flow through the
+// exit silently lost data whenever more than the reader's buffer (io.Copy's
+// 32 KiB) was queued at once, and the peer then waited for the lost tail
+// forever. Caught by the in-process e2e: 256 KiB uploads hung in roughly a
+// third of the runs, a few KiB short.
+func (s *nsStream) readOnce(p []byte) (int, tcpip.Error) {
+	w := tcpip.SliceWriter(p)
+	res, err := s.ep.Read(&w, tcpip.ReadOptions{})
+	return int(res.Count), err
 }
 
 func (s *nsStream) Write(p []byte) (int, error) {
@@ -271,8 +311,10 @@ func forwardTCP(r *tcp.ForwarderRequest, dst *net.TCPAddr) {
 		r.Complete(true)
 		return
 	}
-	real, derr := (&net.Dialer{Timeout: dialTimeout}).Dial("tcp", dst.String())
+	real, derr := exitDial("tcp", dst.String())
 	if derr != nil {
+		// Complete answers the peer, but the endpoint is ours to close.
+		ep.Close()
 		r.Complete(true)
 		return
 	}
@@ -316,7 +358,7 @@ func forwardUDP(r *udp.ForwarderRequest, dst *net.UDPAddr) {
 	if terr != nil {
 		return
 	}
-	real, derr := (&net.Dialer{Timeout: dialTimeout}).Dial("udp", dst.String())
+	real, derr := exitDial("udp", dst.String())
 	if derr != nil {
 		ep.Close()
 		return

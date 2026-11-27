@@ -44,6 +44,12 @@ type peer struct {
 	gatherDone chan struct{}
 }
 
+// settingHook adjusts the SettingEngine after the candidate filters; nil in
+// production. The in-process exit test uses it for loopback-only candidates:
+// the default configuration hides loopback from ICE, and a sandbox has no
+// other interface.
+var settingHook func(*webrtc.SettingEngine)
+
 // newPeer builds the m=video-only PeerConnection. excludeIfs are interface
 // names never to gather candidates on: the tunnel device(s) this daemon
 // serves, plus anything the operator knows is reachable only THROUGH a
@@ -101,6 +107,9 @@ func newPeer(stun []string, excludeIfs, pinIfs []string) (*peer, error) {
 			bad[n] = true
 		}
 		se.SetInterfaceFilter(func(name string) bool { return !bad[name] })
+	}
+	if settingHook != nil {
+		settingHook(&se)
 	}
 	api := webrtc.NewAPI(
 		webrtc.WithMediaEngine(m),

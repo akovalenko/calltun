@@ -40,11 +40,8 @@ func cmdUp(ctx context.Context, args []string) error {
 	extraSSH := fs.Args()
 	initLog(c.verbose)
 
-	if nf.peer != "" && (sshAlias != "" || len(extraSSH) > 0) {
-		return fmt.Errorf("--nostr and --ssh are mutually exclusive")
-	}
-	if nf.peer == "" && sshAlias == "" && len(extraSSH) == 0 {
-		return fmt.Errorf("--ssh (or --nostr) is required")
+	if err := checkSignalingFlags(&nf, sshAlias, extraSSH); err != nil {
+		return err
 	}
 	name, tap, err := resolveDevice(&c)
 	if err != nil {
@@ -67,19 +64,9 @@ func cmdUp(ctx context.Context, args []string) error {
 		defer dev.Close()
 		lg.Info("device attached", "dev", name)
 
-		var sess sigTransport
-		var teardown func()
-		if nf.peer != "" {
-			fan, err := nostrTransport(&nf)
-			if err != nil {
-				return err
-			}
-			sess = fan
-		} else {
-			sess, teardown, err = sshSignaling(&c, sshAlias, extraSSH, offerCmd)
-			if err != nil {
-				return err
-			}
+		sess, teardown, err := openSignaling(&c, &nf, sshAlias, extraSSH, offerCmd)
+		if err != nil {
+			return err
 		}
 		p, err := initiatorSession(ctx, &c, sess, teardown, name, pinIf, excludedIfaces(noIf, name))
 		if err != nil {
@@ -129,6 +116,38 @@ func sshSignaling(c *commonFlags, sshAlias string, extraSSH []string, offerCmd s
 		}
 	}
 	return newSigConn(readWriteCloser{Reader: stdout, Writer: stdin, Closer: stdin}), teardown, nil
+}
+
+// checkSignalingFlags validates the transport selection shared by the
+// initiator modes (up, exit): --nostr is xor with --ssh (or a destination in
+// the trailing args), and one of them is mandatory.
+func checkSignalingFlags(nf *nostrFlags, sshAlias string, extraSSH []string) error {
+	if nf.peer != "" && (sshAlias != "" || len(extraSSH) > 0) {
+		return fmt.Errorf("--nostr and --ssh are mutually exclusive")
+	}
+	if nf.peer == "" && sshAlias == "" && len(extraSSH) == 0 {
+		return fmt.Errorf("--ssh (or --nostr) is required")
+	}
+	return nil
+}
+
+// openSignaling brings up the signaling transport the flags select: the
+// nostr fan (--nostr), or an ssh child running the peer's offer bridge
+// (--ssh and/or a destination in the trailing args). The returned teardown
+// belongs to the caller (nil for nostr); the transport itself is closed by
+// initiatorSession.
+func openSignaling(c *commonFlags, nf *nostrFlags, sshAlias string, extraSSH []string, offerCmd string) (sigTransport, func(), error) {
+	if nf.peer != "" {
+		fan, err := nostrTransport(nf)
+		if err != nil {
+			return nil, nil, err
+		}
+		return fan, nil, nil
+	}
+	if c.link == "" {
+		return nil, nil, fmt.Errorf("--link is required with ssh signaling: it names the peer's offer socket")
+	}
+	return sshSignaling(c, sshAlias, extraSSH, offerCmd)
 }
 
 // initiatorSession brings an initiator from zero to an established link:
@@ -397,13 +416,14 @@ func pinnedIfaces(flagVal, dev string) []string {
 
 // excludedIfaces resolves the interface-exclusion list: --no-if wins,
 // CALLTUN_NO_IF is the fallback (units set it via an EnvironmentFile),
-// and the served device is always excluded last.
+// and the served device is always excluded last (exit has none).
 func excludedIfaces(flagVal, dev string) []string {
 	list := splitList(flagVal)
 	if len(list) == 0 {
 		list = splitList(os.Getenv("CALLTUN_NO_IF"))
 	}
-	if !containsStr(list, dev) {
+	// exit serves no device, hence the empty dev there.
+	if dev != "" && !containsStr(list, dev) {
 		list = append(list, dev)
 	}
 	return list

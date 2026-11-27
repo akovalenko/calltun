@@ -45,13 +45,17 @@ relay.damus.io + nos.lol).
 ## Modes
 
 - `calltun exit --link NAME --tunnel-addr 10.x.y.z --ssh ... [-- <ssh args>]`
-  (userspace build only: `go build -tags userspace`) — the "clean box"
-  side: one binary, no root, no TUN. Frames from the link feed a gVisor
-  netstack with address spoofing; TCP/UDP flows to any destination
-  terminate in userspace and re-originate as real dials (tun2socks-style
-  exit). UDP is a session NAT with idle expiry; ICMP is not forwarded.
-  Everything after `--` goes to ssh verbatim (jump hosts, ports, keys) —
-  also in `up`.
+  or `--nostr PEER --nostr-key FILE` (userspace build only: `go build -tags
+  userspace`) — the "clean box" side: one binary, no root, no TUN. Frames
+  from the link feed a gVisor netstack with address spoofing; TCP/UDP flows
+  to any destination terminate in userspace and re-originate as real dials
+  (tun2socks-style exit). UDP is a session NAT with idle expiry; ICMP is not
+  forwarded, and neither are destinations inside 127/8 (gVisor drops them
+  as martian on a non-loopback NIC, so the exit's own loopback services are
+  not reachable through the link). Everything after `--` goes to ssh
+  verbatim (jump hosts, ports, keys) — also in `up`. Covered by an
+  in-process e2e (`go test -tags userspace`): a second netstack plays the
+  peer over a loopback PeerConnection, 1 MiB of TCP and UDP both ways.
 - `calltun up --link NAME --ssh ALIAS [--offer-cmd calltun]` — initiator
   daemon: spawns `ssh ALIAS calltun offer --link NAME` per attempt,
   exchanges offer/answer (non-trickle), waits for ICE to connect, then the
