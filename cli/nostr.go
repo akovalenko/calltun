@@ -1,4 +1,4 @@
-package main
+package cli
 
 // nostr.go — the nostr signaling transport: the same sigMsg line-JSON
 // (offer/answer/ready/abort) carried inside NIP-59 gift wraps (kind 1059)

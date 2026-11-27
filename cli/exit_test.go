@@ -1,6 +1,6 @@
 //go:build userspace
 
-package main
+package cli
 
 // exit_test.go — in-process end-to-end for exit mode, without root or a
 // TUN. The peer's applications are played by a second gVisor stack (in

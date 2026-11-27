@@ -1,6 +1,6 @@
 //go:build userspace
 
-package main
+package cli
 
 // exit mode: the "clean box" side of a censored acceptor. No TUN, no root:
 // IP frames from the link are fed into a gVisor netstack with address
@@ -71,7 +71,9 @@ func cmdExit(ctx context.Context, args []string) error {
 	fs.StringVar(&noIf, "no-if", "", "comma list of interfaces to never gather ICE candidates on")
 	fs.StringVar(&pinIf, "if", "", "pin ICE candidates to these interfaces ONLY (overrides --no-if)")
 	fs.StringVar(&tunnelAddr, "tunnel-addr", "", "this side's IP inside the link (e.g. 10.187.52.18); required")
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
 	// Everything after "--" goes to ssh verbatim (options and/or the
 	// destination): -J hop, -p port, -i key.
 	extraSSH := fs.Args()

@@ -69,6 +69,12 @@ relay.damus.io + nos.lol).
   (crash-only: a new link is a fresh unit run).
 - `calltun offer --link NAME` — a dumb stdio bridge run by sshd (forced
   command) between the ssh session and the accept daemon's socket.
+- `calltun version` — print the version (set by
+  `-ldflags "-X github.com/akovalenko/calltun/cli.Version=..."`).
+
+The command line lives in package `cli`: `cli.Main(args)` takes the
+arguments without `argv[0]` and returns the exit status, so a multi-call
+binary can embed calltun as an applet (no `os.Exit`, no `flag.CommandLine`).
 
 Common flags: `--dev` (default `--link`), `--mode tun|tap` (default by
 device-name prefix), `--stun LIST` (default `stun.cloudflare.com:3478`;

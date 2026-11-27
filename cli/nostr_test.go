@@ -1,4 +1,4 @@
-package main
+package cli
 
 // Tests for the nostr signaling transport: the wrap/unwrap/filter path
 // (crypto real, relays faked by direct ingest), the attempt correlation

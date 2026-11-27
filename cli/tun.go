@@ -1,4 +1,4 @@
-package main
+package cli
 
 // Attach to an existing persistent TUN/TAP device, the same way ssh does
 // for `ssh -w` (see notes/ssh-w-tun.md): open /dev/net/tun, TUNSETIFF with

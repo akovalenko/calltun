@@ -1,4 +1,4 @@
-package main
+package cli
 
 // calltun stun-probe: measure the built-in STUN collection (plus any
 // extra --stun servers) from THIS host — the tool for "which hosts work
@@ -7,10 +7,10 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
-	"os"
 	"sort"
 	"strings"
 	"time"
@@ -51,7 +51,9 @@ func cmdStunProbe(ctx context.Context, args []string) error {
 	fs := newFlagSet("stun-probe")
 	var c commonFlags
 	registerCommon(fs, &c) // brings --stun; extra servers go there
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
 	initLog(false)
 
 	servers := defaultSTUNServers
@@ -136,7 +138,7 @@ func cmdStunProbe(ctx context.Context, args []string) error {
 	}
 	fmt.Printf("%d/%d reachable\n", okCount, len(all))
 	if okCount == 0 {
-		os.Exit(1)
+		return errors.New("no STUN server reachable")
 	}
 
 	// Phase 2: ONE socket against several servers — the mapping

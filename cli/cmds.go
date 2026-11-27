@@ -1,4 +1,4 @@
-package main
+package cli
 
 // Subcommands. The signaling plane is deliberately decoupled from the link
 // lifetime: after ICE connects and ready/ready is exchanged, the SSH session
@@ -34,7 +34,9 @@ func cmdUp(ctx context.Context, args []string) error {
 	fs.StringVar(&offerCmd, "offer-cmd", "calltun", "remote calltun binary (path or command) for the offer bridge")
 	fs.StringVar(&noIf, "no-if", "", "comma list of interfaces to never gather ICE candidates on (default: --dev)")
 	fs.StringVar(&pinIf, "if", "", "pin ICE candidates to these interfaces ONLY (overrides --no-if)")
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
 	// Everything after "--" goes to ssh verbatim (options and/or the
 	// destination): -J hop, -p port, -i key, ProxyJump garlands.
 	extraSSH := fs.Args()
@@ -195,7 +197,9 @@ func cmdAccept(ctx context.Context, args []string) error {
 	nf.register(fs)
 	fs.StringVar(&noIf, "no-if", "", "comma list of interfaces to never gather ICE candidates on (default: --dev)")
 	fs.StringVar(&pinIf, "if", "", "pin ICE candidates to these interfaces ONLY (overrides --no-if)")
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
 	initLog(c.verbose)
 
 	name, tap, err := resolveDevice(&c)
@@ -354,7 +358,9 @@ func cmdOffer(ctx context.Context, args []string) error {
 	fs := newFlagSet("offer")
 	var link string
 	fs.StringVar(&link, "link", "", "link name (must match the accept daemon)")
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
 	initLog(false)
 	if link == "" {
 		return fmt.Errorf("--link is required")
@@ -391,9 +397,11 @@ func cmdOffer(ctx context.Context, args []string) error {
 	}
 }
 
+// newFlagSet builds a subcommand's FlagSet. ContinueOnError: a library must
+// not exit the process from below, so parseFlags turns -h and bad flags into
+// values Main can return.
 func newFlagSet(name string) *flag.FlagSet {
-	fs := flag.NewFlagSet("calltun "+name, flag.ExitOnError)
-	return fs
+	return flag.NewFlagSet("calltun "+name, flag.ContinueOnError)
 }
 
 func modeName(tap bool) string {

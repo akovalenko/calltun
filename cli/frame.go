@@ -1,4 +1,4 @@
-package main
+package cli
 
 // Fire-and-forget framing: one source frame (IP packet / Ethernet frame)
 // maps to exactly ONE RTP packet — no fragment ids, no reassembly, no

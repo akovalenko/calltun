@@ -1,4 +1,4 @@
-package main
+package cli
 
 // WebRTC setup: a single m=video line, one VP8 codec, no data channels at
 // all — after the DTLS handshake the wire carries only RTP/RTCP plus ICE

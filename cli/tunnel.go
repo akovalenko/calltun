@@ -1,4 +1,4 @@
-package main
+package cli
 
 // The tunnel proper: TUN device <-> RTP track, both directions, until the
 // link dies (ICE state, device error, signal). Crash-only: any failure

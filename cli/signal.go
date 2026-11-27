@@ -1,4 +1,4 @@
-package main
+package cli
 
 // Signaling: the offer/answer exchange, transport-agnostic. The two
 // transports are the SSH stdio pipe (up side) or local unix socket (offer
