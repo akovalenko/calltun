@@ -72,6 +72,7 @@ func cmdUp(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
+		defer p.release()
 		return runTunnel(ctx, p, dev)
 	}
 	if c.forever {
@@ -153,7 +154,8 @@ func openSignaling(c *commonFlags, nf *nostrFlags, sshAlias string, extraSSH []s
 // initiatorSession brings an initiator from zero to an established link:
 // the peer is built, the offer/answer exchanged over the given transport,
 // and the transport torn down. On success the returned peer has a live
-// data plane and needs no signaling anymore.
+// data plane, needs no signaling anymore, and is the caller's to release
+// once the link is over; on failure it is released here.
 func initiatorSession(ctx context.Context, c *commonFlags, sess sigTransport, teardown func(), dev, pinIf string, excluded []string) (*peer, error) {
 	pins := pinnedIfaces(pinIf, dev)
 	p, err := newPeer(stunServers(c.stun), excluded, pins)
@@ -162,6 +164,7 @@ func initiatorSession(ctx context.Context, c *commonFlags, sess sigTransport, te
 	}
 	iceWait, err := time.ParseDuration(c.iceWait)
 	if err != nil {
+		p.release()
 		return nil, fmt.Errorf("--ice-timeout: %w", err)
 	}
 	sctx, cancel := context.WithTimeout(ctx, sigSessionTimeout+iceWait)
@@ -176,6 +179,7 @@ func initiatorSession(ctx context.Context, c *commonFlags, sess sigTransport, te
 		teardown()
 	}
 	if sigErr != nil {
+		p.release()
 		return nil, fmt.Errorf("signaling: %w", sigErr)
 	}
 	lg.Info("signaling complete, transport closed")
@@ -220,6 +224,9 @@ func cmdAccept(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
+		// Every way out of this run — failed wait, failed exchange, dead
+		// link — is done with the peer.
+		defer p.release()
 		iceWait, err := time.ParseDuration(c.iceWait)
 		if err != nil {
 			return fmt.Errorf("--ice-timeout: %w", err)

@@ -44,6 +44,19 @@ type peer struct {
 	gatherDone chan struct{}
 }
 
+// release closes the PeerConnection and frees what it holds: an ICE agent
+// keeps its goroutines and sockets until then (12 goroutines per failed
+// exchange, measured). A crash-only run never needs it — process exit is
+// the teardown — but --forever reruns sessions in place, and every failed
+// or finished attempt would otherwise leave one agent behind. Idempotent.
+func (p *peer) release() {
+	if p == nil || p.pc == nil {
+		return
+	}
+	_ = p.pc.Close()
+	p.pc = nil
+}
+
 // settingHook adjusts the SettingEngine after the candidate filters; nil in
 // production. The in-process exit test uses it for loopback-only candidates:
 // the default configuration hides loopback from ICE, and a sandbox has no
@@ -131,9 +144,11 @@ func newPeer(stun []string, excludeIfs, pinIfs []string) (*peer, error) {
 		"video0", "calltun",
 	)
 	if err != nil {
+		pc.Close()
 		return nil, err
 	}
 	if _, err := pc.AddTrack(track); err != nil {
+		pc.Close()
 		return nil, err
 	}
 
