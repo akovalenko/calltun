@@ -53,11 +53,13 @@ relay.damus.io + nos.lol).
   re-originate as real dials (tun2socks-style exit). UDP is a session NAT
   with idle expiry; ICMP is not forwarded, and neither are destinations
   inside 127/8 (gVisor drops them as martian on a non-loopback NIC, so the
-  exit's own loopback services are not reachable through the link).
-  Everything after `--` goes to ssh verbatim (jump hosts, ports, keys) —
-  also in `up`. Covered by an in-process e2e (`go test -tags userspace`): a
-  second netstack plays the peer over a loopback PeerConnection, 1 MiB of
-  TCP and UDP both ways.
+  exit's own loopback services are not reachable through the link). TCP
+  half-close passes through: a FIN from the peer reaches the server as a
+  FIN, and the reply that follows it is not cut off. Everything after `--`
+  goes to ssh verbatim (jump hosts, ports, keys) — also in `up`. Covered by
+  in-process e2e (`go test -tags userspace`): a second netstack plays the
+  peer over a loopback PeerConnection — 1 MiB of TCP and UDP both ways, a
+  half-closed request, sessions restarted in one process.
 - `calltun up --link NAME --ssh ALIAS [--offer-cmd calltun]` — initiator
   daemon: spawns `ssh ALIAS calltun offer --link NAME` per attempt,
   exchanges offer/answer (non-trickle), waits for ICE to connect, then the
@@ -81,10 +83,12 @@ the exclusion list and is the robust choice for hosts running several
 links (fallback tunnels on one acceptor): pinning the WAN interface
 makes media loops through sibling tunnels impossible by construction.
 Pin lists containing the served device are refused at startup.
-`--forever` (up/accept) — rerun the session in place on any failure,
-attach to tunnel, a fresh signaling exchange each time: the units'
-`Restart=always` without systemd, for manual experiments. External
-SIGTERM is still a clean exit.
+`--forever` (up/accept/exit) — rerun the session in place on any failure:
+attach to tunnel (exit: a fresh netstack), a fresh signaling exchange each
+time — the units' `Restart=always` without systemd, for manual
+experiments. A finished attempt is released in full, the PeerConnection
+first of all: its ICE agent keeps goroutines and sockets until closed.
+External SIGTERM is still a clean exit.
 `CALLTUN_PIONLOG=1` — pion subsystem trace logging. `CALLTUN_FD=<n>`
 (with `CALLTUN_MTU=<bytes>`) — instead of attaching a device locally,
 adopt the tun/tap descriptor a privileged helper attached elsewhere and

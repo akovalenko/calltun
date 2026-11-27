@@ -11,7 +11,12 @@ package main
 // routes whatever it wants through the link.
 //
 // Signaling is the initiator's, exactly as in up: the exit dials — over
-// ssh (--ssh, the peer's forced command) or nostr (--nostr).
+// ssh (--ssh, the peer's forced command) or nostr (--nostr). --forever
+// reruns the session in place, as in up: each run gets a fresh netstack,
+// and everything the previous run created is released.
+//
+// TCP half-close passes through: a FIN from the peer reaches the server as
+// a FIN and the reply that follows it is not cut off.
 //
 // ICMP is not forwarded (no ping through the exit); TCP and UDP only.
 // Destinations inside 127/8 are dropped by the netstack on arrival (gVisor's
@@ -21,6 +26,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -78,22 +84,45 @@ func cmdExit(ctx context.Context, args []string) error {
 		return err
 	}
 	lg.Info("calltun exit starting", "link", c.link, "tunnel-addr", tunnelAddr,
-		"ssh", sshAlias, "ssh_extra", len(extraSSH), "nostr", nf.peer != "")
+		"ssh", sshAlias, "ssh_extra", len(extraSSH), "nostr", nf.peer != "", "forever", c.forever)
 
+	// No served device: the empty name only means "nothing to self-exclude".
+	excluded := excludedIfaces(noIf, "")
+	// One run = transport + exchange + tunnel; --forever reruns it on any
+	// failure, as in up, each time over a fresh netstack.
+	runOnce := func() error {
+		sess, teardown, err := openSignaling(&c, &nf, sshAlias, extraSSH, offerCmd)
+		if err != nil {
+			return err
+		}
+		return exitSession(ctx, &c, sess, teardown, tunnelAddr, pinIf, excluded)
+	}
+	if c.forever {
+		return runForever(ctx, runOnce)
+	}
+	return runOnce()
+}
+
+// exitSession is one exit run: a fresh netstack, the signaling exchange on
+// the given transport, then the tunnel until the link dies. Whatever the
+// run created is released on the way out, so runs can follow each other in
+// one process (--forever).
+func exitSession(ctx context.Context, c *commonFlags, sess sigTransport, teardown func(), tunnelAddr, pinIf string, excluded []string) error {
 	dev, err := newExitStack(ctx, tunnelAddr)
 	if err != nil {
+		// The transport is already open: nobody else is left to close it.
+		sess.Close()
+		if teardown != nil {
+			teardown()
+		}
 		return err
 	}
 	defer dev.Close()
-	sess, teardown, err := openSignaling(&c, &nf, sshAlias, extraSSH, offerCmd)
+	p, err := initiatorSession(ctx, c, sess, teardown, "", pinIf, excluded)
 	if err != nil {
 		return err
 	}
-	// No served device: the empty name only means "nothing to self-exclude".
-	p, err := initiatorSession(ctx, &c, sess, teardown, "", pinIf, excludedIfaces(noIf, ""))
-	if err != nil {
-		return err
-	}
+	defer p.release()
 	return runTunnel(ctx, p, dev)
 }
 
@@ -207,9 +236,13 @@ func (e *exitStack) Write(frame []byte) (int, error) {
 }
 
 // Close tears the stack down: its endpoints close, which ends the forwarder
-// sessions and their real dials.
+// sessions and their real dials. The channel endpoint is ours to stop — a
+// stack does not close link endpoints — and stopping it wakes the frame
+// reader; Wait then lets the workers finish before a next run starts.
 func (e *exitStack) Close() error {
 	e.s.Close()
+	e.ep.Close()
+	e.s.Wait()
 	return nil
 }
 
@@ -220,34 +253,31 @@ type nsStream struct {
 	wq *waiter.Queue
 }
 
+var errWouldBlock = errors.New("netstack: operation would block")
+
 // Read pulls data (a TCP chunk or one UDP datagram) from the endpoint.
 func (s *nsStream) Read(p []byte) (int, error) {
 	for {
-		n, err := s.readOnce(p)
-		if err == nil {
-			return n, nil
-		}
-		if _, block := err.(*tcpip.ErrWouldBlock); !block {
-			return 0, toErr(err)
+		n, err := s.readStep(p)
+		if err != errWouldBlock {
+			return n, err
 		}
 		entry, ch := waiter.NewChannelEntry(waiter.EventIn | waiter.EventErr | waiter.EventHUp)
 		s.wq.EventRegister(&entry)
 		// Re-check after registering (missed-wakeup dance).
-		n, err = s.readOnce(p)
-		if err == nil {
+		n, err = s.readStep(p)
+		if err != errWouldBlock {
 			s.wq.EventUnregister(&entry)
-			return n, nil
-		}
-		if _, block := err.(*tcpip.ErrWouldBlock); !block {
-			s.wq.EventUnregister(&entry)
-			return 0, toErr(err)
+			return n, err
 		}
 		<-ch
 		s.wq.EventUnregister(&entry)
 	}
 }
 
-// readOnce is one non-blocking read of at most len(p) bytes.
+// readStep is one non-blocking read of at most len(p) bytes: io.EOF at the
+// peer's FIN (all of its data drained), errWouldBlock when nothing is
+// pending, any other endpoint condition as an error.
 //
 // The endpoint copies as much as the writer takes, so the writer must be
 // bounded by p. Reading into an unbounded buffer and returning its first
@@ -256,10 +286,29 @@ func (s *nsStream) Read(p []byte) (int, error) {
 // 32 KiB) was queued at once, and the peer then waited for the lost tail
 // forever. Caught by the in-process e2e: 256 KiB uploads hung in roughly a
 // third of the runs, a few KiB short.
-func (s *nsStream) readOnce(p []byte) (int, tcpip.Error) {
+func (s *nsStream) readStep(p []byte) (int, error) {
 	w := tcpip.SliceWriter(p)
 	res, err := s.ep.Read(&w, tcpip.ReadOptions{})
-	return int(res.Count), err
+	switch err.(type) {
+	case nil:
+		return int(res.Count), nil
+	case *tcpip.ErrClosedForReceive:
+		return 0, io.EOF
+	case *tcpip.ErrWouldBlock:
+		return 0, errWouldBlock
+	default:
+		return 0, toErr(err)
+	}
+}
+
+// CloseWrite sends a FIN to the peer and leaves the read side open. Needed
+// for half-close: a peer that finished its request may still be waiting
+// for the reply.
+func (s *nsStream) CloseWrite() error {
+	if err := s.ep.Shutdown(tcpip.ShutdownWrite); err != nil {
+		return toErr(err)
+	}
+	return nil
 }
 
 func (s *nsStream) Write(p []byte) (int, error) {
@@ -320,13 +369,51 @@ func forwardTCP(r *tcp.ForwarderRequest, dst *net.TCPAddr) {
 	}
 	lg.Info("exit tcp session", "dst", dst)
 	local := &nsStream{ep: ep, wq: &wq}
+	go pumpTCP(real, local)
+}
+
+// pumpTCP couples the peer's flow with the real connection until both
+// directions are over. A direction that ends cleanly half-closes its
+// destination: the peer's FIN reaches the server as a FIN, the server's
+// EOF reaches the peer as one. Closing whole on the first finished
+// direction — as this used to — cut off every reply that came after the
+// peer's own FIN (a request ended with "no more data"). A direction that
+// ends with an error tears the session down whole.
+func pumpTCP(real net.Conn, local *nsStream) {
+	var once sync.Once
+	abort := func() { once.Do(func() { real.Close(); local.Close() }) }
+	var wg sync.WaitGroup
+	wg.Add(2)
 	go func() {
-		done := make(chan struct{}, 2)
-		go func() { io.Copy(real, local); real.Close(); done <- struct{}{} }()
-		go func() { io.Copy(local, real); local.Close(); done <- struct{}{} }()
-		<-done
-		<-done
+		defer wg.Done()
+		if _, err := io.Copy(real, local); err == nil {
+			closeWrite(real)
+		} else {
+			abort()
+		}
 	}()
+	go func() {
+		defer wg.Done()
+		if _, err := io.Copy(local, real); err == nil {
+			_ = local.CloseWrite()
+		} else {
+			abort()
+		}
+	}()
+	wg.Wait()
+	real.Close()
+	local.Close()
+}
+
+// closeWrite half-closes the real connection when it can be, and closes it
+// whole when it cannot.
+func closeWrite(real net.Conn) {
+	if hc, ok := real.(interface{ CloseWrite() error }); ok {
+		if hc.CloseWrite() == nil {
+			return
+		}
+	}
+	real.Close()
 }
 
 // --- UDP forwarder (session NAT) ---
